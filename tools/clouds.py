@@ -273,7 +273,7 @@ def convert(t, lat, lon, lw, vis, sw, lw_clear, vis_clear_rho, water, red, model
     if has_vis:
         ok = (wv > 0.99) & (m > 0.4) & (lw > 0)
         if ok.sum() > 200000:
-            edges = [0, 0.5, 4, 9, 18, 32, 48, 70, 100, 256]
+            edges = [0, 0.5, 4, 9, 18, 32, 48, 70, 100, 130, 256]              # (the last: the coldest storm tops, which are also the brightest)
             fit = []
             for a, b in zip(edges[:-1], edges[1:]):
                 sel = ok & (rise >= a) & (rise < b)

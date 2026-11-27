@@ -4,7 +4,7 @@ The Earth as the naked eye would see it from space at this moment: a web app for
 
 **Open it:** [www.adrianorangel.org/earth-now](https://www.adrianorangel.org/earth-now/). On an iPhone, Share → Add to Home Screen makes it an app.
 
-There are no labels, lines, titles or buttons. One finger turns the globe, two fingers move, zoom and twist it, and two fingers dragged straight down tilt the view toward the horizon once you are low enough. Double-tap to step closer; double-tap the Moon to go there.
+There are no labels, lines, titles or buttons. One finger turns the globe, two fingers move, zoom and twist it, and two fingers dragged down together tilt the view toward the horizon once the planet more than fills the screen. Double-tap to step closer; double-tap the Moon to go there.
 
 ## What it shows
 
@@ -29,7 +29,7 @@ No build step. Open `index.html` from any web server to run it.
 
 ## Changing it
 
-When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v19` → `earth-now-v20`). Otherwise phones that already hold the app keep the old copy.
+When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v20` → `earth-now-v21`). Otherwise phones that already hold the app keep the old copy.
 
 ## Clouds
 
