@@ -49,6 +49,6 @@ The aurora's strength follows NOAA's planetary K index when it can be fetched; o
 
 ## Limits
 
-- Tested in a software renderer and on one iPhone; other phones and graphics chips may differ.
+- Checked in a software renderer and tried on one iPhone; other phones and graphics chips may differ.
 - The ground map is about 5 km per pixel, so up close it is softer than the eye would see, and city lights are blobs rather than streets.
 - Lunar craters under about 2 km are generated, not the real ones.
