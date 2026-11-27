@@ -26,7 +26,8 @@ jobs:
       - run: pip install numpy scipy pillow netCDF4 pygrib
       # the last published map: reused beyond the satellites' view if the weather model cannot be fetched
       - run: curl -sfL -o previous.jpg "https://raw.githubusercontent.com/${{ github.repository }}/live/clouds.jpg" || true
-      - run: python tools/clouds.py --out site --previous previous.jpg
+      # (the log is published next to the map, so a bad hour can be looked into)
+      - run: mkdir -p site && set -o pipefail && python tools/clouds.py --out site --previous previous.jpg 2>&1 | tee site/log.txt
       - name: Publish
         run: |
           if [ ! -f site/clouds.jpg ]; then echo "nothing new to publish"; exit 0; fi
