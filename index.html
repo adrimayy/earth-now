@@ -1,0 +1,2428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.png">
+<title>Earth Now</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  canvas{display:block;width:100vw;height:100vh;height:100dvh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+{
+/* ==========================================================================
+   Earth Now — a physically based, naked-eye view of the Earth right now.
+   Lengths in the shaders are in Earth equatorial radii (6378.137 km).
+   World frame = Earth-fixed: +y north pole, lon 0 at +z, lon 90E at +x.
+   Light is carried in photometric units: illuminance in lux, luminance in cd/m².
+   ========================================================================== */
+
+const VS = `#version 300 es
+in vec2 a; void main(){ gl_Position = vec4(a,0.,1.); }`;
+
+const FS = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform int   uMode;                 // 0 display, 1 log-luminance (for eye adaptation)
+uniform vec2  uRes;
+uniform float uPix;                  // radians per framebuffer pixel
+uniform vec3  uCam, uVR, uVU, uVB;   // camera position and view basis
+uniform vec3  uSun;                  // unit vector to the Sun
+uniform float uEsun;                 // solar illuminance at Earth (lux)
+uniform float uSunRad;               // Sun angular radius (rad)
+uniform float uDec;                  // solar declination (deg)
+uniform vec3  uMoon;                 // Moon centre (Earth radii)
+uniform vec3  uMX, uMY, uMZ;         // lunar body axes (east, north, sub-mean-Earth)
+uniform float uEmoon;                // moonlight illuminance at Earth (lux)
+uniform float uEearth;               // earthshine illuminance at the Moon (lux)
+uniform mat3  uW2G;                  // world -> galactic
+uniform vec4  uGd[40]; uniform vec3 uGc[40]; // glare sources: apparent direction + angular size, illuminance at eye (lux, rgb)
+uniform int   uGn;
+uniform float uSigma, uScot, uBlack; // eye adaptation state; uBlack: discounted veiling haze (cd/m²)
+uniform vec4  uFlow; uniform vec3 uOff;
+uniform vec4  uStorm[8];
+uniform sampler2D tDay, tLights, tTopo, tRug, tWater, tMoon, tMW, tCloud, tSeason, tLive, tMoonH, tMoonB;
+uniform vec3 uEcl;                   // north pole of the plane of the planets (ecliptic)
+uniform float uKp;                   // how disturbed Earth's magnetic field is right now (0 calm .. 9 great storm)
+uniform float uMoonHi;               // the Moon's relief and sharper map, loaded on approaching it: 0 = not there, 1 = in use
+uniform float uNoCloud;             // test hook
+uniform float uQ;                   // 1: still frame (full quality), 0: moving (lighter marching)
+uniform float uTexR;                // elevation-map texels per radian
+uniform vec3  uMonth;                // month a, month b (0-11), blend
+uniform float uLive, uLiveAge;       // live cloud map loaded?, its age (hours)
+
+const float PI = 3.14159265359;
+const float FL  = 0.0033528107;           // WGS84 flattening
+const float EY  = 1.0/(1.0-FL);
+const float KM  = 1.0/6378.137;
+const float HR  = 8.0*KM, HM = 1.2*KM;    // scale heights
+const vec3  BR  = vec3(7.189, 13.762, 32.518)*6.378137; // Rayleigh scattering per Earth radius, integrated over sRGB channels
+const float BMS = 3.996*6.378137, BME = 4.40*6.378137;  // Mie scattering / extinction
+const vec3  BO  = vec3(0.650, 1.881, 0.085)*6.378137;   // ozone absorption
+const float OZC = 25.0*KM, OZW = 15.0*KM;
+const float ATM = 100.0*KM;
+const float RMOON = 1737.4/6378.137;
+
+// ---------------------------------------------------------------- noise
+float hash(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),             hash(i+vec3(1,0,0)), f.x),
+                 mix(hash(i+vec3(0,1,0)), hash(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i+vec3(0,0,1)), hash(i+vec3(1,0,1)), f.x),
+                 mix(hash(i+vec3(0,1,1)), hash(i+vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p, float oct){
+  float a = 0.5, s = 0.0;
+  for (int i = 0; i < 12; i++){
+    float w = clamp(oct - float(i), 0.0, 1.0);
+    if (w <= 0.0) { s += a*1.1; break; }
+    s += a*mix(0.5, noise(p), w);
+    p = p*2.03 + vec3(1.7, 9.2, 3.1); a *= 0.56;
+  }
+  return s;
+}
+vec3 rotAxis(vec3 v, vec3 k, float a){ float c = cos(a), s = sin(a); return v*c + cross(k,v)*s + k*dot(k,v)*(1.0-c); }
+vec3 rotY(vec3 v, float a){ float c = cos(a), s = sin(a); return vec3(c*v.x + s*v.z, v.y, -s*v.x + c*v.z); }
+float angBetween(vec3 a, vec3 b){ return 2.0*asin(clamp(length(a-b)*0.5, 0.0, 1.0)); } // precise for small angles
+vec2 uvOf(vec3 n){ return vec2(atan(n.x, n.z)/(2.0*PI) + 0.5, 0.5 - asin(clamp(n.y,-1.,1.))/PI); }
+float lum(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// ---------------------------------------------------------------- atmosphere
+float altitude(vec3 p){ float r = length(p); float s = p.y/r; return r - (1.0 - FL*s*s); }
+// Chapman grazing-incidence function (Schüler's approximation), X = r/H
+float chap(float X, float cosc){
+  float c = sqrt(1.5707963*X);
+  if (cosc >= 0.0) return c/((c-1.0)*cosc + 1.0);
+  float s = sqrt(max(1.0 - cosc*cosc, 0.0));
+  return 2.0*sqrt(1.5707963*X*s)*exp(min(X*(1.0 - s), 60.0)) - c/((c-1.0)*(-cosc) + 1.0);
+}
+float ozAbove(float h){ return clamp((OZC + OZW - h)/(2.0*OZW), 0.0, 1.0); }
+// transmittance from altitude h along a direction whose cosine to local vertical is cosc
+vec3 transCos(float r, float h, float cosc){
+  float cR = chap(r/HR, cosc), cM = chap(r/HM, cosc);
+  vec3 tau = BR*HR*exp(-h/HR)*cR + BME*HM*exp(-h/HM)*cM + BO*OZW*ozAbove(h)*min(cR, 40.0);
+  return exp(-tau);
+}
+// diffuse skylight on a horizontal surface at altitude h: light scattered out of the solar beam,
+// half of the Rayleigh part and ~85% of the forward-peaked Mie part continues downward
+vec3 diffuseIrr(float r, float h, float sinApp, float mu){
+  float cR = chap(r/HR, max(sinApp, 0.0)), cM = chap(r/HM, max(sinApp, 0.0));
+  vec3 tR = BR*HR*exp(-h/HR)*cR; float tM = BMS*HM*exp(-h/HM)*cM;
+  vec3 tA = BO*OZW*ozAbove(h)*min(cR, 40.0) + (BME - BMS)*HM*exp(-h/HM)*cM;
+  vec3 ts = tR + tM;
+  vec3 Ed = uEsun*max(sinApp, 0.0)*exp(-tA)*(1.0 - exp(-ts))*(0.5*tR + 0.85*tM)/ts*0.9;
+  Ed += uEsun*0.0021*exp(min(mu, 0.0)*60.0)*vec3(0.62, 0.80, 1.0)*step(mu, 0.0); // twilight sky after sunset
+  return Ed;
+}
+// spherical albedo of the atmosphere above altitude h: light the surface reflects that the sky sends back
+// Atmospheric refraction for a ray grazing at tangent altitude h: total bending (rad).
+// delta = (n0-1) sqrt(2 pi r / H) exp(-h/H), n0-1 = 2.93e-4 at sea level, H = 8 km -> 1.17 deg at the surface
+float refrBend(float h){ return 2.93e-4*sqrt(2.0*PI*(1.0 + h)/HR)*exp(-h/HR); }
+// optical depth of a full tangent chord at altitude h (Rayleigh + aerosol + ozone shell)
+vec3 tauChord(float h){
+  float r = 1.0 + h;
+  float oz = 2.0*(sqrt(max(pow(1.0+OZC+OZW, 2.0) - r*r, 0.0)) - sqrt(max(pow(1.0+OZC-OZW, 2.0) - r*r, 0.0)));
+  return BR*HR*exp(-h/HR)*2.0*sqrt(1.5708*r/HR) + BME*HM*exp(-h/HM)*2.0*sqrt(1.5708*r/HM) + BO*0.5*oz;
+}
+// limb-darkened photosphere radiance seen along direction d
+vec3 sunL(vec3 d, float aa){
+  float a = angBetween(d, uSun);
+  if (a > uSunRad + aa) return vec3(0.0);
+  float x = clamp(a/uSunRad, 0.0, 1.0), m = sqrt(1.0 - x*x);
+  vec3 u = vec3(0.47, 0.56, 0.68);
+  vec3 I = (1.0 - u*(1.0 - m))/(1.0 - u/3.0);
+  float edge = aa > 0.0 ? clamp((uSunRad - a)/aa + 0.5, 0.0, 1.0) : 1.0;
+  return uEsun/(PI*uSunRad*uSunRad)*I*edge;
+}
+// seasonal change of the surface (NASA Blue Marble NG monthly maps): snow cover, sea ice, vegetation
+vec3 seasonD(vec2 uv, float m){
+  vec2 t = vec2(mod(m, 4.0) + clamp(uv.x, 0.0005, 0.9995), floor(m/4.0) + clamp(uv.y, 0.001, 0.999))/vec2(4.0, 3.0);
+  vec3 e = textureLod(tSeason, t, 0.0).rgb*2.0 - 1.0;
+  return sign(e)*e*e;
+}
+vec3 sphAlb(float h){ vec3 t = BR*HR*exp(-h/HR); return 0.92*t*exp(-t) + 0.02*exp(-h/HM); }
+float overlap(float r1, float r2, float d){            // fraction of disc r1 covered by disc r2
+  if (d >= r1 + r2) return 0.0;
+  if (d <= abs(r2 - r1)) return r2 >= r1 ? 1.0 : (r2*r2)/(r1*r1);
+  float a = r1*r1*acos(clamp((d*d + r1*r1 - r2*r2)/(2.0*d*r1), -1., 1.))
+          + r2*r2*acos(clamp((d*d + r2*r2 - r1*r1)/(2.0*d*r2), -1., 1.))
+          - 0.5*sqrt(max((-d+r1+r2)*(d+r1-r2)*(d-r1+r2)*(d+r1+r2), 0.0));
+  return a/(PI*r1*r1);
+}
+// visible fraction of the solar disc from a point whose horizon dips by 'dip' (rad),
+// including refraction (Saemundsson). Returns apparent sine of elevation in 'sinApp'.
+float sunDisc(float sinGeo, float dip, out float sinApp){
+  float h = degrees(asin(clamp(sinGeo, -1., 1.)));
+  float hh = max(h + degrees(dip), -1.5);
+  float R = 1.02/tan(radians(hh + 10.3/(hh + 5.11)))/60.0;
+  float ha = h + R;
+  sinApp = sin(radians(ha));
+  float x = clamp((ha + degrees(dip))/degrees(uSunRad), -1.0, 1.0);
+  return 1.0 - (acos(x) - x*sqrt(1.0 - x*x))/PI;
+}
+float solarEclipse(vec3 p){
+  vec3 m = uMoon - p; float dm = length(m);
+  return 1.0 - overlap(uSunRad, asin(RMOON/dm), angBetween(m/dm, uSun));
+}
+
+// ---------------------------------------------------------------- generated clouds
+float sq(float x){ return x*x; }                            // never pow(x, 2.0): pow of a negative base is undefined (NaN on phone GPUs)
+float wind(float latDeg){
+  float w = -0.0045*exp(-sq(latDeg/16.0)) + 0.013*exp(-sq((abs(latDeg)-47.0)/15.0));
+  return w/max(cos(radians(latDeg)), 0.25);
+}
+// --- gradient noise (Gustavson/McEwan simplex, mod-289 permutation: smooth, no grid, precision-safe)
+vec3 m289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+vec4 m289(vec4 x){ return x - floor(x*(1.0/289.0))*289.0; }
+vec4 perm(vec4 x){ return m289(((x*34.0) + 10.0)*x); }
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0); const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i = floor(v + dot(v, C.yyy)), x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz), l = 1.0 - g, i1 = min(g.xyz, l.zxy), i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx, x2 = x0 - i2 + C.yyy, x3 = x0 - D.yyy;
+  i = m289(i);
+  vec4 p = perm(perm(perm(i.z + vec4(0.0, i1.z, i2.z, 1.0)) + i.y + vec4(0.0, i1.y, i2.y, 1.0)) + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  vec3 ns = 0.142857142857*D.wyz - D.xzx;
+  vec4 j = p - 49.0*floor(p*ns.z*ns.z), x_ = floor(j*ns.z), y_ = floor(j - 7.0*x_);
+  vec4 x = x_*ns.x + ns.yyyy, y = y_*ns.x + ns.yyyy, h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy), b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0)*2.0 + 1.0, s1 = floor(b1)*2.0 + 1.0, sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy, a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x), p1 = vec3(a0.zw, h.y), p2 = vec3(a1.xy, h.z), p3 = vec3(a1.zw, h.w);
+  vec4 nrm = 1.79284291400159 - 0.85373472095314*vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3));
+  p0 *= nrm.x; p1 *= nrm.y; p2 *= nrm.z; p3 *= nrm.w;
+  vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0); m = m*m;
+  return 105.0*dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+// fBm of simplex noise in [0,1], fractional octave count fades detail in by zoom (no popping)
+float sfbm(vec3 p, float oct, float gain){
+  float a = 0.5, s = 0.0, t = 0.0;
+  for (int i = 0; i < 10; i++){
+    float w = clamp(oct - float(i), 0.0, 1.0); if (w <= 0.0) break;
+    s += a*w*snoise(p); t += a; p = p*2.02 + vec3(13.1, 7.3, 3.7); a *= gain;
+  }
+  return 0.5 + 0.5*s/max(t, 1e-3)*1.6;
+}
+// billowy (cauliflower) detail: 1 - |noise|
+float billow(vec3 p, float oct){
+  float a = 0.5, s = 0.0, t = 0.0;
+  for (int i = 0; i < 7; i++){
+    float w = clamp(oct - float(i), 0.0, 1.0); if (w <= 0.0) break;
+    s += a*w*(1.0 - abs(snoise(p))); t += a*w; p = p*2.07 + vec3(4.7, 1.3, 9.1); a *= 0.55;
+  }
+  return t > 0.0 ? s/t : 0.5;
+}
+// cellular F1 (2x2x2 nearest cells, jittered) for marine stratocumulus cells
+vec3 gCell;                                                // (set by worley: from here to the nearest cell's middle)
+float worley(vec3 P){
+  vec3 Pi = floor(P), Pf = fract(P), o = step(0.5, Pf) - 1.0; float d = 9.0; gCell = vec3(0.0);
+  for (int k = 0; k < 8; k++){
+    vec3 c = o + vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1));
+    vec3 cc = m289(Pi + c);
+    vec4 h = perm(perm(perm(vec4(cc.x)) + cc.y) + cc.z + vec4(0.0, 17.0, 41.0, 0.0));
+    vec3 jit = fract(h.xyz*(1.0/41.0))*0.8 + 0.1;
+    vec3 r = c + jit - Pf; float dd = dot(r, r);
+    if (dd < d){ d = dd; gCell = r; }
+  }
+  return sqrt(d);
+}
+// bright but shallow: marine stratocumulus decks over cold water just west of the subtropical continents
+// (off California, Peru, Namibia). Everywhere else, brighter cloud is taken to be deeper cloud.
+float lowDeck(vec3 p){
+  float lat = degrees(asin(clamp(p.y,-1.,1.)));
+  float landE = 1.0 - min(textureLod(tWater, uvOf(rotY(p, 0.12)), 5.0).r, textureLod(tWater, uvOf(rotY(p, 0.25)), 5.0).r);
+  return exp(-sq((abs(lat) - 22.0)/10.0))*textureLod(tWater, uvOf(p), 6.0).r*landE;
+}
+float cmap(vec2 uv, float lod){ return uLive > 0.5 ? textureLod(tLive, uv, lod).r : textureLod(tCloud, uv, lod).r; }
+const float CBASE = 2.0*KM, CTOP = 11.0*KM;                // cloud layer: lowest tops, highest tops
+// where a place's cloud is read from in the map: the live map carried by the winds since it was made,
+// or the stored map wandering slowly (a bounded warp that changes over ~2 days)
+vec3 cwarp(vec3 p, float lat){
+  if (uLive > 0.5) return rotY(p, -wind(lat)*min(uLiveAge, 36.0));
+  vec3 t = p*2.6 + uOff*1.8;
+  return normalize(p + 0.03*vec3(snoise(t), snoise(t + 7.1), snoise(t + 13.7)));
+}
+float cfrac(vec3 pw, float lod, float lat){                // cloud fraction 0..1 from the map
+  float c = cmap(uvOf(pw), lod);
+  c *= 0.45 + 0.55*smoothstep(-74.0, -64.0, lat);           // the map's Antarctic ice brightness is not cloud
+  return clamp((c - 0.06)/0.94, 0.0, 1.0);
+}
+// optical thickness that goes with a cloud fraction
+float tauOfC(float c){ float R = clamp(pow(c, 1.15)*mix(0.5, 0.9, smoothstep(0.2, 0.85, c)), 0.0, 0.93); return R/(0.075*(1.0 - R)); }
+// how high the cloud reaches: set so the map gives the real spread of cloud-top heights
+// (about a fifth of the globe under tops above 6 km, a tenth above 9 km; most cloud low)
+float topOfC(float c, float deck){ return CBASE + (CTOP - CBASE)*smoothstep(0.12, 0.72, c)*(1.0 - 0.85*deck); }
+// Returns cloud OPTICAL THICKNESS tau.
+// Base: a real global cloud field (NASA Blue Marble cloud layer, from satellite). It is not today's weather,
+// but it has real weather's structure: cyclones, fronts, cloud streets, trade cumulus, stratocumulus decks.
+// Below the map's ~10 km resolution it resolves into puffs and streaks.
+float gPuff; vec3 gPuffUp;                                 // (set by cloudsW: how much of this spot is a cumulus puff, and its uphill direction x steepness)
+float cloudsW(vec3 p, vec3 pw, float oct){
+  gPuff = 0.0; gPuffUp = vec3(0.0);
+  float lat = degrees(asin(clamp(p.y, -1., 1.)));
+  float fp = 0.5/(7.0*exp2(oct));                          // pixel footprint (rad) implied by oct
+  float lod = log2(max(fp*652.0, 1.0));
+  float c = cfrac(pw, lod, lat);
+  // The map value is the cloud FRACTION in each ~10 km pixel. Zoomed past that, it resolves into separate
+  // puffs covering that fraction (fair-weather cumulus), while solid decks stay solid.
+  float Rmax = mix(0.5, 0.9, smoothstep(0.2, 0.85, c));     // scattered cumulus are thinner than decks
+  float cov = c;
+  // individual cumulus ~4 km apart, sized so their area matches the map's fraction, grouped into clusters,
+  // with lumpy (cauliflower) edges; only once a cell spans a few pixels (otherwise the fraction IS the look)
+  const float CU = 650.0*2.5;                                // cells per radian (~4 km)
+  float pxPerCell = (1.0/CU)/fp;
+  // cumulus fields are mostly a tropical/subtropical-ocean look; mid-latitude cloud is mostly layered (fronts)
+  float cuType = mix(0.25, 1.0, exp(-sq(lat/30.0)));
+  float aC = smoothstep(2.0, 5.0, pxPerCell)*(1.0 - smoothstep(0.88, 0.98, c))*cuType;
+  // layered cloud: soft, wind-streaked texture instead of puffs
+  float sOct = clamp(log2((1.0/650.0)/(fp*3.0)) + 1.0, 0.0, 5.0);
+  if (sOct > 0.0){
+    vec3 qs = pw*650.0*vec3(1.0, 2.2, 1.0);
+    float sd = sfbm(qs + 0.4*vec3(snoise(qs*0.3), snoise(qs*0.3 + 5.0), 0.0), sOct, 0.5);
+    cov = clamp(c + (sd - 0.5)*0.9*(1.0 - abs(2.0*c - 1.0))*smoothstep(0.0, 1.0, sOct), 0.0, 1.0);
+  }
+  if (aC > 0.0){
+    vec3 qd = pw*CU;
+    float cluster = sfbm(qd*0.18 + 5.0, 3.0, 0.5);
+    float fr = clamp(c*(0.35 + 1.3*cluster), 0.0, 1.0);
+    float r = sqrt(fr/3.1416)*1.2;
+    float lOct = clamp(log2((0.25/CU)/(fp*2.0)) + 2.0, 0.0, 4.0);
+    float lump = lOct > 0.0 ? (sfbm(qd*4.0, lOct, 0.55) - 0.5)*0.22 : 0.0;
+    float F1 = worley(qd + 0.25*vec3(snoise(qd*0.5), snoise(qd*0.5 + 4.0), 0.0));
+    float soft = max(0.03, 1.5/pxPerCell);
+    float puffs = 1.0 - smoothstep(r - soft, r + soft, F1 + lump);
+    // A cumulus is a heap, not a disc: deep and bright in the middle, thin and greyer toward its rim, with the
+    // lumps of its turrets. (Its average stays what the map says, so from afar nothing changes.)
+    float dome = sqrt(clamp(1.0 - (F1 + lump)/max(r, 0.05), 0.0, 1.0)), near = smoothstep(4.0, 10.0, pxPerCell);
+    puffs *= mix(1.0, 0.5 + 0.94*dome, near);
+    gPuff = aC*near*step(0.5, puffs + 0.5*step(F1 + lump, r));
+    // the heap's slope: about as tall as it is wide across (a puff r cells wide rises ~0.6 r cells)
+    gPuffUp = gCell/max(F1, 0.02)*(0.6*0.5/max(dome, 0.25));
+    cov = mix(cov, puffs, aC);
+  }
+  float R = clamp(pow(max(cov, 0.0), 1.15)*Rmax, 0.0, 0.93);   // reflectance of the cloudy part
+  return R/(0.075*(1.0 - R));                               // invert two-stream: R -> tau
+}
+float clouds(vec3 p, float oct){ return cloudsW(p, cwarp(p, degrees(asin(clamp(p.y, -1., 1.)))), oct); }
+// fraction of light a cloud of optical thickness tau reflects (two-stream, conservative scattering, g = 0.85)
+float cloudR(float tau){ return 0.075*tau/(1.0 + 0.075*tau); }
+
+// ---------------------------------------------------------------- terrain: real heights, TRUE SCALE (no vertical exaggeration)
+// Elevation map: NASA Blue Marble topography, value 0..1 = 0..6400 m. Checked against 23 known elevations
+// (Denver, Lhasa, La Paz, the South Pole...): 25.0 m per count, 66 m rms. Everest is 0.14% of the Earth's radius.
+// Relief finer than the map's ~5 km is ridged fractal noise whose strength at each place is the MEASURED relief
+// the map cannot show there (rms of the 1.85 km data about the map: Alps ~250 m, Kansas ~10 m) - rugged where
+// the Earth is rugged, flat where it is flat, never taller than the data says.
+const float HS = 6400.0/6378137.0, RS = 600.0/6378137.0;   // map values -> Earth radii
+const float HTOP = 7.6*KM;                                 // nothing stands higher than this
+const float TF = 1300.0;                                   // first detail octave: ~5 km cells
+#define TEXR uTexR                                         // elevation texels per radian
+float altE(vec3 p){ return length(vec3(p.x, p.y*EY, p.z)) - 1.0; }   // height above the ellipsoid (exactly 0 on it)
+vec3 geoN(vec3 p){ return normalize(vec3(p.x, p.y*EY*EY, p.z)); }
+float terrDetail(vec3 d, float oct){                       // zero mean; rms 1 with the first octave, 1.1 with all three
+  float a = 1.0, s = 0.0; vec3 q = d*TF;
+  for (int i = 0; i < 3; i++){
+    float w = clamp(oct - float(i), 0.0, 1.0); if (w <= 0.0) break;
+    float nz = snoise(q), r = 1.0 - sqrt(nz*nz + 0.01);    // ridges, with rounded crests
+    s += a*w*(r*r - 0.53)/0.27;                            // mean and spread of r*r for this noise (measured)
+    q = q*2.03 + vec3(7.3, 1.1, 4.7); a *= 0.45;
+  }
+  return s;
+}
+float terrH(vec3 d, float lod, float oct){                 // ground height above the ellipsoid, Earth radii
+  vec2 uv = uvOf(d);
+  float h = textureLod(tTopo, uv, lod).r*HS;
+  if (oct > 0.0 && h > 0.0){
+    float rg = max(textureLod(tRug, uv, 0.0).r*RS - 1.6e-6, 0.0);   // minus the map's own ~10 m rounding noise
+    if (rg > 0.0) h += rg*min(1.0, h/(2.5*rg))*terrDetail(d, oct);
+  }
+  return h;
+}
+// First point where the ray goes under the ground between ta and tb (-1: none). 'closed': the ray is known to
+// be under the ground at tb. A cheap pass on the map alone finds where the ray comes within reach of the terrain;
+// from there it walks forward by a fraction of its clearance (safe for slopes up to ~50 deg) with the fine relief.
+float terrMarch(vec3 ro, vec3 rd, float ta, float tb, float pix, float oct, bool closed, float M){   // M: reach of the fine relief here
+  float n1 = clamp(ceil((tb - ta)/(2.0*ta*pix)), 6.0, uQ > 0.5 ? 24.0 : 14.0);       // no finer than ~2 pixels
+  float dt = (tb - ta)/n1, lod = max(log2(dt*TEXR) - 1.0, log2(max(ta*pix*TEXR, 1.0)));
+  float tz = -1.0, te = tb, t = ta;
+  for (int i = 0; i <= 24; i++){
+    if (float(i) > n1) break;
+    vec3 q = ro + rd*t;
+    float c = altE(q) - textureLod(tTopo, uvOf(geoN(q)), lod).r*HS;
+    if (tz < 0.0){ if (c < M) tz = max(t - dt, ta); }
+    if (tz >= 0.0 && c < -M){ te = t; closed = true; break; }
+    t += dt;
+  }
+  if (tz < 0.0) return -1.0;
+  float a = tz, c = 1.0; t = tz;
+  int n2 = uQ > 0.5 ? 18 : 10;
+  for (int i = 0; i < 18; i++){
+    if (i >= n2) break;
+    vec3 q = ro + rd*t;
+    c = altE(q) - terrH(geoN(q), log2(max(t*pix*TEXR, 1.0)), min(oct, 1.5));
+    if (c < 0.0) break;
+    a = t; t += max(0.55*c, 0.75*t*pix);
+    if (t >= te){ t = te; c = closed ? -1.0 : 1.0; break; }
+  }
+  if (c >= 0.0) return c < (uQ > 0.5 ? 2.0 : 6.0)*t*pix ? t : -1.0;   // out of steps while skimming the ground: call it touched
+  float b = t;
+  for (int k = 0; k < 4; k++){
+    float m = 0.5*(a + b); vec3 q = ro + rd*m;
+    if (altE(q) - terrH(geoN(q), log2(max(m*pix*TEXR, 1.0)), oct) < 0.0) b = m; else a = m;
+  }
+  return 0.5*(a + b);
+}
+// How much of the Sun a ground point sees past the terrain toward it (long mountain shadows at low sun).
+// The point and the terrain it is tested against are taken from the same smoothed model of the ground,
+// so a slope never shadows itself by accident.
+float terrShadow(vec3 p, vec3 n, float sinE, float pixLod){
+  float lodS = max(pixLod, 1.0);
+  vec3 p0 = p + n*(terrH(n, lodS, 0.0) - altE(p) + 40.0/6378137.0);   // cast shadows come from the mapped relief only
+  float L = min(6.0*KM/max(sinE, 0.06), 90.0*KM), sh = 1.0;
+  for (int k = 1; k <= 8; k++){
+    float t = L*float(k*k)/64.0;
+    vec3 q = p0 + uSun*t;
+    float c = altE(q) - terrH(geoN(q), lodS, 0.0);
+    sh = min(sh, smoothstep(-0.5, 1.0, c/max(0.03*t, 40.0/6378137.0)));
+  }
+  return sh;
+}
+
+// ---------------------------------------------------------------- human eye glare (CIE 2002, age 25)
+float glare(float thetaRad, float minRad){        // L_veil / E_glare, theta in degrees, p = 0.5, A = 25
+  float t = max(degrees(thetaRad), degrees(minRad));
+  return 10.0/(t*t*t) + 5.13/(t*t) + 0.0513/t + 0.00125;
+}
+
+// ---------------------------------------------------------------- the Moon's relief
+// Height of the lunar surface above its mean sphere (in Earth radii), from NASA's laser altimetry (LOLA, 16 points
+// per degree): a smooth large-scale shape (tMoonB) plus fine detail stored with more precision where it is small.
+float erfA(float x){ float x2 = x*x; return sign(x)*sqrt(max(1.0 - exp(-x2*(1.2732395 + 0.147*x2)/(1.0 + 0.147*x2)), 0.0)); }
+// A sheet of glow, Gaussian across (1 at its middle): how much of it a straight stretch running from x0 to x1 (in
+// widths from the middle) passes on average, and how far along the stretch (0..1) that glow is centred.
+vec2 sheet(float x0, float x1){
+  float dx = x1 - x0, g0 = exp(-x0*x0), g1 = exp(-x1*x1);
+  if (abs(dx) < 0.02) return vec2(0.5*(g0 + g1), 0.5);
+  float de = erfA(x1) - erfA(x0);
+  if (abs(de) < 1.0e-6) return vec2(0.0, 0.5);
+  return vec2(0.8862269*de/dx, clamp((0.5*(g0 - g1)/(0.8862269*de) - x0)/dx, 0.0, 1.0));
+}
+float aurP(float hkm){ return hkm < 107.0 ? clamp((hkm - 97.0)/10.0, 0.0, 1.0) : exp(-(hkm - 107.0)/22.0); }   // a curtain's glow with height
+const float MTOP = 11000.0/6378137.0, MBOT = 9500.0/6378137.0;
+vec2 moonUV(vec3 nm){ return vec2(atan(dot(nm,uMX), dot(nm,uMZ))/(2.0*PI) + 0.5, 0.5 - asin(clamp(dot(nm,uMY),-1.,1.))/PI); }
+float moonH(vec2 uv, float lod){
+  float e = textureLod(tMoonH, uv, lod).r*2.0 - 1.0;
+  return (textureLod(tMoonB, uv, 0.0).r*20500.0 - 9500.0 + e*abs(e)*8000.0)/6378137.0;
+}
+// How much of the Sun a spot on the Moon sees past the terrain that lies toward it (1 = all of it).
+// P0: the spot, relative to the Moon's centre. The ray to the Sun is followed until it clears the highest peaks.
+float moonShadow(vec3 P0, float lod, int n){
+  float b = dot(P0, uSun), c = dot(P0, P0) - (RMOON + MTOP)*(RMOON + MTOP), D = b*b - c;
+  if (D <= 0.0) return 1.0;
+  float lmax = -b + sqrt(D), vis = 1.0;
+  for (int k = 1; k <= 12; k++){
+    if (k > n) break;
+    float f = float(k)/float(n), l = lmax*f*f;
+    vec3 p = P0 + uSun*l; float r = length(p);
+    float w = l*0.0047 + 1.2e-5;                                   // the Sun's half-width at that distance (and the map's own 80 m steps): a soft edge
+    vis = min(vis, smoothstep(-w, w, r - RMOON - moonH(moonUV(p/r), lod)));
+    if (vis <= 0.0) break;
+  }
+  return vis;
+}
+// Craters smaller than the elevation map can show (it has one point every 1.9 km). These are not the Moon's actual
+// small craters - nobody ships those in a few megabytes - but they have the real Moon's crowding, size mix, depths
+// and raised rims, and without them the ground seen from low orbit would be smooth, which it is not.
+// Returns the slope they add (a vector along the ground: rise over run) and how much of the Sun they hide.
+vec4 hash43(vec3 p){
+  vec4 q = fract(vec4(p.xyzx)*vec4(0.1031, 0.1030, 0.0973, 0.1099)); q += dot(q, q.wzxy + 33.33);
+  return fract((q.xxyz + q.yzzw)*q.zywx);
+}
+void moonCraters(vec3 nm, float fp, float crowd, out vec3 grad, out float shade){
+  grad = vec3(0.0); shade = 1.0;
+  float se = dot(nm, uSun); vec3 sT = uSun - nm*se; float ch = max(length(sT), 1e-4); sT /= ch;
+  float tanE = se/ch;
+  for (int k = 0; k < 7; k++){
+    float cell = (8.0/1737.4)*exp2(-float(k));                       // 8 km, 4 km, 2 km ... (in Moon radii)
+    float vis = clamp(cell/(4.0*fp) - 0.5, 0.0, 1.0);                // gone once its craters are a pixel or two across
+    if (vis <= 0.0) break;
+    vec3 P = nm/cell, b = floor(P - 0.5);
+    for (int i = 0; i < 8; i++){
+      vec3 id = b + vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
+      vec4 r = hash43(id + float(k)*17.0);
+      if (r.w > crowd) continue;
+      vec3 c = (id + 0.25 + 0.5*r.xyz)*cell; float cl = length(c);
+      if (abs(cl - 1.0) > 0.5*cell) continue;                        // (cells that do not straddle the surface)
+      vec3 dv = nm - c/cl; dv -= nm*dot(dv, nm);                     // from the crater's centre, along the ground
+      vec4 r2 = hash43(id*1.37 + 5.1 + float(k)*3.0);
+      float Rc = cell*(0.09 + 0.33*r2.x*r2.x*r2.x), dl = length(dv), rho = dl/Rc;   // radius: many small, few large
+      if (rho > 2.5) continue;
+      float fresh = 0.12 + 0.88*r2.y*r2.y*r2.y;                      // most are worn down: shallower, softer rims
+      float d = 0.36*Rc*fresh, hr = 0.07*Rc*fresh;                   // a fresh one: depth 0.18 x diameter, rim 0.035
+      vec3 u = dv/max(dl, 1e-9);
+      grad += u*(vis*(rho < 1.0 ? 2.0*(d + hr)*rho/Rc : -3.0*hr/(Rc*rho*rho*rho*rho)));
+      if (tanE > 0.0){                                               // the rim's shadow: inside the bowl, and behind it
+        float a = dot(dv, sT)/Rc, soft = 0.03 + 1.5*fp/Rc, sdw = -1.0;
+        if (rho < 1.0){ float L = -a + sqrt(a*a + 1.0 - rho*rho); sdw = (d + hr)*(1.0 - rho*rho)/(L*Rc) - tanE; }
+        else { float D = a*a - (rho*rho - 1.0);
+          if (a < 0.0 && D > 0.0){ float L = -a - sqrt(D); sdw = hr*(1.0 - 1.0/(rho*rho*rho))/(max(L, 1e-3)*Rc) - tanE; } }
+        shade *= 1.0 - vis*smoothstep(-soft*max(tanE, 0.05), soft*max(tanE, 0.05), sdw);
+      }
+    }
+  }
+}
+// The Moon's surface darkens with phase angle much faster than its geometry alone explains (the full Moon is about
+// 11 times brighter than the half Moon, not 2.7): the measured phase law divided by the Lommel-Seeliger one.
+float moonPhase(float cosA){
+  float al = clamp(acos(clamp(cosA, -1.0, 1.0)), 2.0e-3, 2.618), ad = degrees(al);
+  float real = pow(10.0, -0.4*(0.026*ad + 4.0e-9*ad*ad*ad*ad));
+  float ls = 1.0 - sin(0.5*al)*tan(0.5*al)*log(1.0/tan(0.25*al));
+  return real/max(ls, 1.0e-3);
+}
+
+void main(){
+  vec3 Lcity = vec3(0.0);                                   // street lighting reaching the eye from this spot (kept apart: see the rods, at the end)
+  vec2 fc = gl_FragCoord.xy - 0.5*uRes;
+  vec3 rd = normalize(uVR*fc.x*uPix + uVU*fc.y*uPix - uVB);
+  vec3 ro = uCam;
+
+  // ---- WGS84 ellipsoid intersection (scaled space) ----
+  vec3 roS = vec3(ro.x, ro.y*EY, ro.z), rdS = vec3(rd.x, rd.y*EY, rd.z);
+  float qa = dot(rdS,rdS), qb = dot(roS,rdS);
+  float D = qb*qb - qa*(dot(roS,roS) - 1.0);
+  float tg = D > 0.0 ? (-qb - sqrt(D))/qa : -1.0;
+  bool hit = tg > 0.0;
+  float tca = max(-dot(ro, rd), 0.0);
+  vec3 pmin = ro + rd*tca;
+  float dl = length(vec3(pmin.x, pmin.y*EY, pmin.z)) - 1.0;
+  float cov = hit ? clamp(0.5 - dl/(max(tca,1e-4)*uPix), 0.0, 1.0) : 0.0;
+  vec3 p = hit ? ro + rd*tg : pmin/length(vec3(pmin.x, pmin.y*EY, pmin.z));
+  vec3 n = normalize(vec3(p.x, p.y*EY*EY, p.z));             // geodetic normal
+  float dist = hit ? tg : tca;
+  float fp = max(dist, 1e-5)*uPix;                           // pixel footprint (rad of arc)
+
+  // ---- terrain in true relief: marched only where its height would shift things by about a pixel ----
+  bool nearT = false;
+  {
+    float cT = dot(roS,roS) - (1.0 + HTOP)*(1.0 + HTOP), dT = qb*qb - qa*cT;
+    if (dT > 0.0){
+      float ta = max((-qb - sqrt(dT))/qa, 0.0), tb = hit ? tg : (-qb + sqrt(dT))/qa;
+      float mv = hit ? dot(n, -rd) : 0.0;
+      if (tb > ta && 4.0*KM*sqrt(max(1.0 - mv*mv, 0.0)) > 0.75*ta*uPix){
+        vec3 pa = ro + rd*ta, pm = ro + rd*0.5*(ta + tb);
+        float land = textureLod(tTopo, uvOf(n), 6.0).r + textureLod(tTopo, uvOf(geoN(pa)), 6.0).r + textureLod(tTopo, uvOf(geoN(pm)), 5.0).r;
+        if (land > 0.002){
+          nearT = true;
+          float octM = clamp(log2((1.0/TF)/(ta*uPix*4.0)) + 1.0, 0.0, 3.0);
+          float reach = (octM > 0.0 ? 3.3*max(textureLod(tRug, uvOf(n), 3.0).r, textureLod(tRug, uvOf(geoN(pm)), 3.0).r)*RS : 0.0) + 40.0/6378137.0;
+          float tT = terrMarch(ro, rd, ta, tb, uPix, octM, hit, reach);
+          if (tT > 0.0){ hit = true; tg = tT; p = ro + rd*tT; cov = 1.0; n = geoN(p); dist = tT; fp = max(dist, 1e-5)*uPix; }
+        }
+      }
+    }
+  }
+
+  // ---- textures (seam-safe gradients) ----
+  vec2 uv = uvOf(n);
+  vec2 uvB = vec2(fract(uv.x + 0.5) - 0.5, uv.y);
+  vec2 dx = dFdx(uv), dy = dFdy(uv), dxB = dFdx(uvB), dyB = dFdy(uvB);
+  if (abs(dxB.x) + abs(dyB.x) < abs(dx.x) + abs(dy.x)) { dx.x = dxB.x; dy.x = dyB.x; }
+  vec3 Lg = vec3(0.0); float Lw = 0.0;                        // ground: light toward the eye; what a white surface would send
+  if (cov > 0.0){                                             // (rays that miss the globe skip all of this)
+  float water = textureGrad(tWater, uv, dx, dy).r;
+  vec3 tex = pow(textureGrad(tDay, uv, dx, dy).rgb, vec3(2.2));
+  tex = max(tex + mix(seasonD(uv, uMonth.x), seasonD(uv, uMonth.y), uMonth.z), 0.0);
+  float ice = water*smoothstep(0.12, 0.3, lum(tex));          // sea ice: bright, matte, no glint
+  water *= 1.0 - ice;
+  // The map is a display image, not reflectance: calibrate. Land is desaturated and scaled toward measured
+  // reflectances (forest ~0.03/0.05/0.02, Sahara ~0.46/0.37/0.27); snow and ice set to ~0.95.
+  float tl = lum(tex);
+  vec3 albedo = mix(vec3(tl), tex, mix(0.75, 1.1, smoothstep(0.04, 0.3, tl)))*mix(1.0, 0.7, smoothstep(0.1, 0.5, tl));
+  float snowy = smoothstep(0.86, 0.95, min(tex.r, min(tex.g, tex.b))/max(max(tex.r, tex.g), tex.b)*1.0)*smoothstep(0.35, 0.55, tl);
+  albedo = mix(albedo, vec3(0.90, 0.94, 0.96)*clamp(tl/0.6, 0.6, 1.0), snowy);
+  albedo = mix(albedo, tex, water);                         // ocean colours were already set from optics
+  albedo = mix(albedo, vec3(0.80, 0.84, 0.88)*clamp(lum(tex)/0.55, 0.5, 1.05), ice);
+  float lightsV = textureGrad(tLights, uv, dx, dy).r;
+  float lat = asin(clamp(n.y,-1.,1.)), lon = atan(n.x, n.z);
+  vec3 east = vec3(cos(lon), 0.0, -sin(lon));
+  vec3 north = vec3(-sin(lat)*sin(lon), cos(lat), -sin(lat)*cos(lon));
+  // surface normal from the real slope of the ground (rise over run, both in Earth radii: true scale)
+  float lodT = log2(max(fp*TEXR, 1.0));
+  float octT = clamp(log2((1.0/TF)/(fp*4.0)) + 1.0, 0.0, 3.0);  // an octave joins in once its cells span ~4 pixels
+  float eT = 1.2*max(fp, 1.0/TEXR);
+  float hg = terrH(n, lodT, octT);                            // ground height here
+  vec2 sl = vec2(terrH(normalize(n + east*eT), lodT, octT) - hg, terrH(normalize(n + north*eT), lodT, octT) - hg)/eT;
+  sl *= smoothstep(0.0012, 0.005, length(sl));                // slopes within the map's 25 m rounding count as flat
+  vec3 nb = normalize(n - sl.x*east - sl.y*north);
+  float detail = 1.0 - smoothstep(0.0002, 0.0009, fp);
+  if (detail > 0.0){                                          // fine colour variation below the image's resolution
+    float f0 = 1200.0, oct = clamp(log2(0.5/(fp*f0)), 0.0, 7.0);
+    albedo *= 1.0 + detail*(sfbm(n*f0, oct, 0.55) - 0.5)*mix(0.45, 0.08, water);
+  }
+
+  // ---- direct sunlight at the ground: refraction, disc, extinction, eclipse, cloud shadow ----
+  float mu = dot(n, uSun), sinApp;
+  float vis = sunDisc(mu, 0.0, sinApp);
+  vec3  Tg  = transCos(1.0 + hg, hg, max(sinApp, 0.0));     // less air above high ground
+  float tsh = (fp < 2.0e-4 && mu > -0.02 && mu < 0.5 && water < 0.5) ? terrShadow(p, n, max(sinApp, 0.0), lodT) : 1.0;
+  float ecl = solarEclipse(p);
+  float octC = clamp(log2(0.5/(fp*7.0)), 1.0, 11.0);
+  // cloud shadows, cast along the sun from the cloud's real height: low cloud from ~3 km, and deep cloud
+  // from its upper part too, so tall systems throw long shadows when the sun is low
+  vec3 dS = (uSun - n*mu)/max(mu, 0.06);
+  vec3 ps = normalize(p + dS*3.0*KM), pwS = cwarp(ps, degrees(lat));
+  float tauS = cloudsW(ps, pwS, max(octC - 2.0, 1.0));
+  if (mu < 0.6){                                              // (with the sun high the two fall in the same place)
+    vec3 p7 = normalize(p + dS*7.5*KM);
+    float c7 = cfrac(normalize(p7 + (pwS - ps)), max(log2(max(fp*652.0, 1.0)), 1.0), degrees(lat));
+    tauS = max(tauS, tauOfC(c7)*smoothstep(7.0*KM, 8.5*KM, topOfC(c7, 0.0)));
+  }
+  float shadow = 1.0 - cloudR(tauS/max(mu, 0.25))*step(-0.05, mu);
+  if (uNoCloud > 0.5 && uNoCloud < 1.5) shadow = 1.0;
+  vec3 Edir = uEsun*Tg*vis*ecl*shadow*tsh;
+  float cosI = max(dot(nb, uSun) + (sinApp - mu), 0.0);
+  vec3 Esky = diffuseIrr(1.0 + hg, hg, sinApp, mu)*ecl*(0.55 + 0.45*shadow);
+  // in rugged country a shaded slope is also lit by the sunlit slopes around it (why shadows on snow are not black)
+  if (water < 0.98 && sinApp > 0.0) Esky += 0.25*clamp(textureLod(tRug, uv, 0.0).r*600.0/150.0, 0.0, 1.0)*(1.0 - water)*albedo*uEsun*Tg*vis*ecl*shadow*sinApp;
+  vec3 mdir = normalize(uMoon - p); float mmu = dot(n, mdir);
+  vec3 Emoon = uEmoon*max(mmu, 0.0)*transCos(1.0, 0.0, max(mmu, 0.02));
+  Lg = albedo/PI*(Edir*cosI + Esky + Emoon)/(1.0 - sphAlb(hg)*albedo);
+  Lw = lum(Edir*max(sinApp, 0.0) + Esky + Emoon)/PI;
+  // City lights (cd/m²). Their colour: orange sodium lamps and the white LEDs replacing them, about half and half
+  // by now - a warm yellow. Astronauts see these colours by eye; photographs only make them stronger.
+  Lcity = vec3(1.14, 0.775, 0.376)*0.5*pow(lightsV, 2.2);
+  Lg += Lcity;
+  // ocean: Cox-Munk sun glint (wind 7 m/s) + Fresnel sky reflection
+  vec3 v = -rd, hv = normalize(uSun + v);
+  float cb = max(dot(n, hv), 1e-3), wind = 7.0;
+  // the sea is not equally rough everywhere: calm patches and windy ones, tens to hundreds of km across, make the
+  // glint patchy - mirror-bright where it is calm at its centre, dark where it is calm off to the side
+  if (water > 0.02 && cb > 0.86) wind = 7.0*exp(0.55*snoise(p*46.0 + uOff*3.0) + 0.3*snoise(p*170.0 - uOff*5.0));
+  float sig2 = 0.003 + 0.00512*wind;
+  float tan2 = (1.0 - cb*cb)/(cb*cb);
+  float F = 0.02 + 0.98*pow(1.0 - clamp(dot(hv, v), 0.0, 1.0), 5.0);
+  float muv = max(dot(n, v), 0.03);
+  Lg += water*Edir*F*exp(-tan2/sig2)/(PI*sig2)/(4.0*muv*cb*cb*cb*cb)*step(0.0, mu);
+  Lg += water*(0.02 + 0.98*pow(max(1.0 - muv, 0.0), 5.0))*Esky/PI;
+  vec3 hm = normalize(mdir + v); float cbm = max(dot(n, hm), 1e-3), tan2m = (1.0 - cbm*cbm)/(cbm*cbm);
+  float Fm = 0.02 + 0.98*pow(1.0 - clamp(dot(hm, v), 0.0, 1.0), 5.0);
+  Lg += water*uEmoon*transCos(1.0, 0.0, max(mmu, 0.02))*Fm*exp(-tan2m/sig2)/(PI*sig2)/(4.0*muv*cbm*cbm*cbm*cbm)*step(0.0, mmu);
+  }
+
+  // ---- clouds, with real thickness ----
+  // Cloud tops form a height field (thin broken cloud ~2 km, deep systems to ~11 km). The ray is marched against it,
+  // so tall cloud stands above low cloud, hides what is behind it, shows its flanks, and mountains poke through.
+  float cloudA = 0.0, LwC = 0.0; vec3 Lc = vec3(0.0);
+  float cTq = dot(roS,roS) - (1.0 + CTOP)*(1.0 + CTOP), cD = qb*qb - qa*cTq;
+  if (cD > 0.0 && (uNoCloud < 0.5 || uNoCloud > 1.5)){
+    float t0 = max((-qb - sqrt(cD))/qa, 0.0), t1 = hit ? tg : (-qb + sqrt(cD))/qa;
+    if (t1 > t0){
+      vec3 nref = normalize(ro + rd*mix(t0, t1, 0.6)); float latR = degrees(asin(clamp(nref.y, -1., 1.)));
+      vec3 W = cwarp(nref, latR) - nref;                       // one shift for the whole ray (it varies slowly)
+      float deck = abs(abs(latR) - 22.0) < 18.0 ? lowDeck(nref) : 0.0;
+      float mvC = hit ? clamp(dot(n, -rd), 0.0, 1.0) : 0.0;
+      int NS = CTOP*sqrt(1.0 - mvC*mvC) > 0.6*t0*uPix ? (uQ > 0.5 ? 16 : 9) : 3;  // march only where height shifts things by a pixel
+      float dtc = (t1 - t0)/float(NS), lodP = log2(max(t0*uPix*652.0, 1.0)), lodM = max(log2(max(dtc*652.0, 1.0)) - 1.0, lodP);
+      float ta_ = t0, tb_ = -1.0;
+      for (int i = 1; i <= NS; i++){
+        float t = t0 + dtc*float(i); vec3 q = ro + rd*t;
+        if (altE(q) < topOfC(cfrac(normalize(normalize(q) + W), lodM, latR), deck)){ tb_ = t; break; }
+        ta_ = t;
+      }
+      if (tb_ > 0.0){
+        for (int k = 0; k < 4; k++){
+          float m = 0.5*(ta_ + tb_); vec3 q = ro + rd*m;
+          if (altE(q) < topOfC(cfrac(normalize(normalize(q) + W), lodP, latR), deck)) tb_ = m; else ta_ = m;
+        }
+        float tc = 0.5*(ta_ + tb_);
+        vec3 pc = ro + rd*tc, nc = normalize(pc);
+        float hc = clamp(altE(pc), 0.0, CTOP);
+        float oc = clamp(log2(0.5/(tc*uPix*7.0)), 1.0, 11.0);
+        vec3 pwc = normalize(nc + W);
+        float tauC = cloudsW(nc, pwc, oc);
+        float puffA = gPuff; vec3 puffUp = gPuffUp;               // (kept: the shadow test below calls cloudsW again)
+        // seen at a slant, the path through the cloud is longer: thin cloud looks denser toward the limb
+        float Rc = cloudR(tauC/clamp(dot(nc, -rd), 0.3, 1.0));
+        float muC = dot(nc, uSun), sA;
+        float visC = sunDisc(muC, sqrt(2.0*hc), sA);              // high tops stay sunlit after the ground is dark
+        vec3 Tc = transCos(1.0 + hc, hc, sA);
+        // lit and shaded flanks: the slope of the cloud tops (true scale)
+        float latc = asin(clamp(nc.y,-1.,1.)), lonc = atan(nc.x, nc.z);
+        vec3 eC = vec3(cos(lonc), 0.0, -sin(lonc)), nC = vec3(-sin(latc)*sin(lonc), cos(latc), -sin(latc)*cos(lonc));
+        float lodc = max(lodP, 1.0), eA = exp2(lodc)/652.0;       // one map texel at that level, radians
+        float hE = topOfC(cfrac(normalize(pwc + eC*eA), lodc, latR), deck) - topOfC(cfrac(normalize(pwc - eC*eA), lodc, latR), deck);
+        float hN = topOfC(cfrac(normalize(pwc + nC*eA), lodc, latR), deck) - topOfC(cfrac(normalize(pwc - nC*eA), lodc, latR), deck);
+        vec3 nRel = normalize(nc - (hE*eC + hN*nC)/(2.0*eA));
+        float relief = clamp((max(dot(nRel, uSun), 0.0) + 0.08)/(max(muC, 0.0) + 0.08), 0.25, 2.5);
+        // taller cloud toward the Sun shades this spot
+        float csh = 1.0;
+        if (muC > -0.05 && muC < 0.6){
+          for (int k = 1; k <= 3; k++){
+            float sK = min((CTOP - hc)*float(k)/3.0/max(muC, 0.04), 250.0*KM);
+            vec3 q = pc + uSun*sK;
+            float top = topOfC(cfrac(normalize(normalize(q) + W), max(lodc, log2(max(sK*0.3*652.0, 1.0))), latR), deck);
+            csh = min(csh, 1.0 - 0.85*smoothstep(0.0, 1.5*KM, top - altE(q)));
+          }
+        }
+        // a cumulus heap is brighter on its sunward side and dimmer on the far one (softened: cloud scatters light around inside)
+        if (puffA > 0.0){
+          float sunH2 = max(1.0 - muC*muC, 0.0);
+          relief *= mix(1.0, clamp(1.0 + 0.6*dot(puffUp, uSun - nc*muC)/max(muC, 0.15), 0.45, 1.6), puffA*step(1.0e-4, sunH2));
+        }
+        float wrap = clamp((sA + 0.12)/1.12, 0.0, 1.0)*relief*csh;
+        vec3 Ec = uEsun*Tc*visC*solarEclipse(pc);
+        float mmc = dot(nc, normalize(uMoon - pc));
+        vec3 Eci = Ec*wrap + diffuseIrr(1.0 + hc, hc, sA, muC) + uEmoon*max(mmc, 0.0);
+        Lc = Eci/PI/(1.0 - sphAlb(hc)*Rc);                        // blended by Rc below: reflected = Rc*Lc
+        LwC = lum(Eci)/PI;
+        cloudA = Rc;
+      }
+    }
+  }
+
+  // ---- space behind: Milky Way, background starlight, Sun disc, Moon ----
+  vec3 G = uW2G*rd;
+  vec2 guv = vec2(atan(G.y, G.x)/(2.0*PI) + 0.5, 0.5 - asin(clamp(G.z,-1.,1.))/PI);
+  float mw = textureLod(tMW, guv, 0.0).r;
+  vec3 Lbg = vec3(1.0, 0.96, 0.88)*(7e-5 + 1.0e-3*pow(mw, 1.3));
+  float aS = angBetween(rd, uSun);
+  // The Sun's corona, thinning out into the zodiacal light (sunlight on the dust between the planets). It is always
+  // there, a millionth as bright as the Sun's face at its edge, and is seen when the Sun itself is hidden - as the
+  // Apollo crews saw it rise ahead of the Sun from behind the Moon. Brightness: the standard corona law, carried
+  // outward along the measured zodiacal light; farther from the Sun it flattens toward the plane of the planets.
+  {
+    float rho = max(aS/uSunRad, 1.0);                                   // solar radii from the Sun's centre
+    float Kc = 1.425*pow(rho, -7.0) + 2.565*pow(rho, -17.0);            // glowing gas
+    float Fc = rho < 20.0 ? 0.0532*pow(rho, -2.5) : 2.97e-5*pow(rho/20.0, -2.2);   // dust
+    vec3 tS = rd - uSun*dot(rd, uSun); float tl = length(tS);
+    float off = tl > 1.0e-5 ? dot(tS, uEcl)/tl : 0.0;                   // 0 along the plane of the planets, 1 at right angles to it
+    Lbg += vec3(1.0, 0.97, 0.92)*(uEsun/(PI*uSunRad*uSunRad))*1.0e-6*(Kc + Fc/(1.0 + 2.3*smoothstep(4.0, 60.0, rho)*off*off));
+  }
+  // Sun: rays that graze the atmosphere are bent toward the Earth (refraction), which lifts and flattens
+  // the low part of the disc and lets sunlight from behind the Earth through the limb (red eclipse ring).
+  // The pixel's span of tangent altitudes is supersampled because the bent image is far thinner than a pixel.
+  vec3 Lsun = vec3(0.0);
+  float hT = length(pmin) - 1.0;
+  if (dot(ro, rd) >= 0.0 || hT > ATM) Lsun = sunL(rd, uPix);
+  else if (cov < 1.0){
+    vec3 upT = normalize(pmin); float span = max(tca, 1e-4)*uPix;
+    for (int k = 0; k < 24; k++){
+      float h = hT + ((float(k) + 0.5)/24.0 - 0.5)*span;
+      if (h <= 0.0 || h > ATM) { if (h > ATM) Lsun += sunL(rd, 0.0); continue; }
+      vec3 d = normalize(rd - upT*tan(refrBend(h)));
+      Lsun += sunL(d, 0.0)*exp(-tauChord(h));
+    }
+    Lsun /= 24.0;
+  }
+  vec3 oc = ro - uMoon; float mb = dot(oc, rd), moc = dot(oc, oc);
+  float mD = mb*mb - (moc - RMOON*RMOON);                       // the mean sphere
+  float mDo = uMoonHi > 0.0 ? mb*mb - (moc - (RMOON + MTOP)*(RMOON + MTOP)) : mD;   // with relief: a shell that holds every peak
+  bool moonFront = false; vec3 Lmoon = vec3(0.0); float LwM = 0.0;
+  if (mDo > 0.0){
+    float tm = -mb - sqrt(mDo); bool mhit = mD > 0.0;
+    if (mhit && uMoonHi <= 0.0) tm = -mb - sqrt(mD);
+    if (tm > 0.0 && (!hit || tm < tg)){
+      float mlod = log2(max(652.0*tm*uPix/RMOON, 1.0));        // (for the 4096-wide maps; 652 texels per radian)
+      float hq = 0.0;
+      if (uMoonHi > 0.0){
+        // Up close the real surface is found along the ray (mountains stand out against the sky and hide what is
+        // behind them); from far away the relief is smaller than a pixel and the mean sphere will do.
+        float sinV = mhit ? sqrt(max(1.0 - mD/(RMOON*RMOON), 0.0)) : 1.0;
+        if (6000.0/6378137.0*sinV > 0.75*tm*uPix){
+          float mDi = mb*mb - (moc - (RMOON - MBOT)*(RMOON - MBOT));
+          float t1m = mDi > 0.0 ? -mb - sqrt(mDi) : -mb + sqrt(mDo), ta = tm, tb = -1.0, t = tm;
+          float floorStep = (t1m - tm)/(uQ > 0.5 ? 40.0 : 24.0);
+          for (int i = 0; i < 40; i++){
+            vec3 p = ro + rd*t - uMoon; float r = length(p), cl = r - RMOON - moonH(moonUV(p/r), mlod);
+            if (cl < 0.0){ tb = t; break; }
+            ta = t; t += max(0.8*cl, floorStep);
+            if (t > t1m){ if (mDi > 0.0) tb = t1m; break; }
+          }
+          if (tb > 0.0){
+            for (int i = 0; i < 5; i++){
+              float tc = 0.5*(ta + tb); vec3 p = ro + rd*tc - uMoon; float r = length(p);
+              if (r - RMOON - moonH(moonUV(p/r), mlod) < 0.0) tb = tc; else ta = tc;
+            }
+            tm = 0.5*(ta + tb); mhit = true;
+          } else mhit = false;                                  // passed between the peaks: sky
+        } else if (mhit) tm = -mb - sqrt(mD);
+      }
+      if (mhit && (!hit || tm < tg)){
+      vec3 q = ro + rd*tm, nm = normalize(q - uMoon);
+      vec2 muv2 = moonUV(nm);
+      vec3 mtex = textureLod(tMoon, muv2, mlod).rgb; float ml = lum(mtex);
+      // (the sharper map is toned a little differently from the first one: bring it onto the same albedo scale)
+      float A = 0.105*pow(max(mix(ml, 1.42*ml - 0.20, uMoonHi), 0.03)/0.58, 1.7);
+      // Colour: Moon soil reflects more red light than blue (about 1.12 : 1 : 0.85), which makes it a brownish grey -
+      // what the Apollo 10 crew called tan and brown. The maps carry less of that tint than the soil has, so they
+      // give the differences from place to place and the soil's measured colour sets the whole.
+      vec3 mcol = pow(max(mtex, vec3(1.0e-3))/max(ml, 1.0e-3), vec3(2.2))*mix(vec3(1.12, 1.0, 0.85), vec3(1.092, 1.0, 0.919), uMoonHi);
+      mcol /= lum(mcol);
+      vec3 nrel = nm; float msh = 1.0;
+      if (uMoonHi > 0.0){
+        // real slopes: the surface is tilted by the rise over run of the terrain, east and north
+        float st = exp2(mlod)/4096.0, cph = max(sqrt(max(1.0 - dot(nm,uMY)*dot(nm,uMY), 0.0)), 0.05);
+        float run = 2.0*st*2.0*PI*RMOON;
+        float sE = (moonH(muv2 + vec2(st/cph, 0.0), mlod) - moonH(muv2 - vec2(st/cph, 0.0), mlod))/run;
+        float sN = (moonH(muv2 - vec2(0.0, 2.0*st), mlod) - moonH(muv2 + vec2(0.0, 2.0*st), mlod))/run;
+        vec3 ex = cross(uMY, nm), eastM = ex/max(length(ex), 1e-4), northM = cross(nm, eastM);
+        // ...and the craters too small for the map
+        float mvg = max(dot(nm, -rd), 0.15); vec3 cg; float csh;
+        moonCraters(nm, tm*uPix/(RMOON*mvg), mix(0.3, 0.8, smoothstep(0.38, 0.6, 1.42*ml - 0.20)), cg, csh);
+        nrel = normalize(nm - (sE*eastM + sN*northM + cg)*uMoonHi);
+        hq = moonH(muv2, mlod);
+        msh = mix(1.0, csh, uMoonHi);
+        // shadows cast by crater rims and mountains, where the Sun is low enough for them to be longer than a pixel
+        float seM = dot(nm, uSun);
+        if (seM < 0.55 && dot(nrel, uSun) > 0.0 && 1500.0/6378137.0 > 0.5*tm*uPix*max(seM, 0.02))
+          msh *= mix(1.0, moonShadow((RMOON + hq + 3.0e-6)*nm, mlod, uQ > 0.5 ? 12 : 7), uMoonHi);
+      }
+      float m0 = dot(nrel, uSun), mv = max(dot(nrel, -rd), 0.02);
+      // lunar eclipse: Earth's umbra/penumbra (atmosphere widens Earth by ~2%)
+      vec3 toE = normalize(-q);
+      float lvis = 1.0 - overlap(uSunRad, asin(1.0/length(q))*1.02, angBetween(toE, uSun));
+      float fph = moonPhase(dot(uSun, -rd));
+      vec3 Ls = mcol*(A/PI*uEsun*(2.0*max(m0,0.0)/(max(m0,0.0) + mv))*fph*lvis*msh);
+      Ls += A/PI*uEsun*vec3(1.0, 0.3, 0.1)*2e-4*(1.0 - lvis)*step(0.0, m0); // red light bent through Earth's air
+      float me = max(dot(nrel, normalize(-uMoon)), 0.0);
+      Ls += mcol*vec3(0.89, 0.98, 1.17)*(A/PI*uEearth*(2.0*me/(me + mv))*moonPhase(dot(normalize(-uMoon), -rd)));   // earthshine (the Earth's light is bluer than the Sun's)
+      Lmoon = Ls; LwM = uEsun*max(dot(nm, uSun), 0.0)*fph*lvis/PI;   // (what the eye takes for white here follows the same law)
+      if (hit) moonFront = true; else { Lbg = Ls; Lsun = vec3(0.0); }
+      }
+    }
+  }
+
+  // ---- atmosphere along the view ray: single scattering, 12 samples ----
+  vec3 inS = vec3(0.0), Tv = vec3(1.0);
+  float RA = 1.0 + ATM;
+  float ab = dot(ro, rd), ad = ab*ab - (dot(ro,ro) - RA*RA);
+  float nu = dot(rd, uSun);
+  float phR = 3.0/(16.0*PI)*(1.0 + nu*nu);
+  const float g = 0.8;
+  float phM = 3.0*(1.0-g*g)*(1.0+nu*nu)/(8.0*PI*(2.0+g*g)*pow(1.0+g*g-2.0*g*nu, 1.5));
+  if (ad > 0.0){
+    float t0 = max(-ab - sqrt(ad), 0.0), t1 = -ab + sqrt(ad);
+    if (hit) t1 = min(t1, tg);
+    float L = t1 - t0;
+    if (L > 0.0){
+      float tm = clamp(-ab, t0, t1);
+      for (int i = 0; i < 12; i++){
+        float u = (float(i) + 0.5)/12.0, t, dt;
+        if (hit){ t = t0 + L*(1.0 - (1.0-u)*(1.0-u)); dt = L*2.0*(1.0-u)/12.0; }
+        else { float s = 2.0*u - 1.0; float hl = (s < 0.0) ? tm - t0 : t1 - tm; t = tm + hl*s*abs(s); dt = hl*4.0*abs(s)/12.0; }
+        vec3 ps = ro + rd*t; float r = length(ps); float h = max(altitude(ps), 0.0);
+        float dR = exp(-h/HR), dM = exp(-h/HM), dO = max(0.0, 1.0 - abs(h - OZC)/OZW);
+        vec3 ext = BR*dR + BME*dM + BO*dO;
+        vec3 Ts = vec3(0.0);
+        float cosc = dot(ps, uSun)/r;
+        float tang = r*sqrt(max(1.0 - cosc*cosc, 0.0)) - (r - h);
+        float blk = cosc < 0.0 ? smoothstep(-2.0*KM, 2.0*KM, tang) : 1.0;
+        if (blk > 0.0) Ts = transCos(r, h, cosc)*blk;
+        vec3 Tstep = exp(-ext*dt);
+        inS += Tv*(BR*dR*phR + BMS*dM*phM)*Ts*(1.0 - Tstep)/ext;
+        Tv *= Tstep;
+      }
+      inS *= uEsun*1.12;                         // +12% for multiple scattering
+    }
+  }
+  // airglow: thin emitting layer at 90-100 km (chemiluminescence, mostly O 557.7 nm)
+  float ag = 0.0;
+  {
+    float r1 = 1.0 + 90.0*KM, r2 = 1.0 + 100.0*KM;
+    float d2 = ab*ab - (dot(ro,ro) - r2*r2);
+    if (d2 > 0.0){
+      float s0 = max(-ab - sqrt(d2), 0.0), s1 = -ab + sqrt(d2);
+      if (hit) s1 = min(s1, tg);
+      float chord = max(s1 - s0, 0.0);
+      float d1 = ab*ab - (dot(ro,ro) - r1*r1);
+      if (d1 > 0.0){ float e0 = max(-ab - sqrt(d1), 0.0), e1 = -ab + sqrt(d1); if (hit) e1 = min(e1, tg); chord -= max(e1 - e0, 0.0)*step(0.0, e1); }
+      ag = max(chord, 0.0)/(10.0*KM);
+    }
+  }
+
+  // aurora: the ovals around the two magnetic poles - a faint broad band (1 kilorayleigh seen from above on a quiet
+  // night) and, on its poleward side, two thin curtains (6 and 3 kR) hanging from 100 km upward, brightest around
+  // magnetic midnight. How strong and how far from the poles it is follows the planetary activity index when that
+  // can be fetched (otherwise an ordinary quiet night); where each curtain runs this minute cannot be known.
+  // Each stretch of the ray is integrated exactly across the curtains, so thin ones never shimmer.
+  float aurL = 0.0;
+  {
+    float ra = 1.0 + 97.0*KM, rb = 1.0 + 200.0*KM, oo = dot(ro, ro), d2 = ab*ab - (oo - rb*rb);
+    const vec3 MAGP = vec3(-0.1543, 0.9869, 0.0481);                 // geomagnetic north pole (80.7 N, 72.7 W)
+    if (d2 > 0.0){
+      float q2 = sqrt(d2), s0 = max(-ab - q2, 0.0), s1 = -ab + q2;
+      if (hit) s1 = min(s1, tg);
+      if (s1 > s0){
+        vec3 pA = normalize(ro + rd*s0), pB = normalize(ro + rd*s1);
+        float kq = uKp - 2.0, grow = 0.026*kq, strong = exp(0.47*kq);     // per step of activity: 1.5 degrees wider, 1.6x brighter
+        // (not worked out where it could not be seen: far from the ovals, in full daylight, or with eyes used to brightness)
+        if (max(abs(dot(pA, MAGP)), abs(dot(pB, MAGP))) > cos(0.62 + max(grow, 0.0)) && min(dot(pA, uSun), dot(pB, uSun)) < 0.25 && uSigma < 0.25*strong){
+          float d1 = ab*ab - (oo - ra*ra);
+          vec2 A = vec2(s0, s1), B = vec2(0.0);                       // one stretch inside the layer - or two, around a dip below it
+          if (d1 > 0.0){ float q1 = sqrt(d1), e0 = -ab - q1, e1 = -ab + q1; if (e1 > s0){ A.y = min(max(e0, s0), s1); B = vec2(max(e1, s0), s1); } }
+          vec3 ax = dot(pA + pB, MAGP) > 0.0 ? MAGP : -MAGP;
+          vec3 sp = normalize(uSun - ax*dot(uSun, ax)), c = normalize(ax - (0.073 + 0.009*kq)*sp), e2 = cross(c, sp);   // the oval sits ~4 degrees toward the night side
+          float wpx = 0.7*uPix*0.5*(s0 + s1);                         // (a curtain is never drawn thinner than a pixel; it is dimmed instead)
+          vec3 wid = vec3(0.0384*(1.0 + 0.1*kq), max(7.7e-4, wpx), max(6.0e-4, wpx));
+          vec3 amp = vec3(exp(0.26*kq), strong*6.0*7.7e-4/wid.y, strong*3.0*6.0e-4/wid.z)/27.0;
+          vec3 xp = vec3(0.0), gp = vec3(0.0);
+          int NI = uQ > 0.5 ? 6 : 3;                                  // pieces per stretch
+          for (int k = 0; k < 14; k++){
+            if (k >= 2*NI + 2) break;
+            vec2 seg = k <= NI ? A : B; float len = seg.y - seg.x; int j = k <= NI ? k : k - NI - 1;
+            if (len <= 0.0) continue;
+            float t = seg.x + len*float(j)/float(NI);
+            vec3 pd = normalize(ro + rd*t), tv = pd - c*dot(pd, c);
+            float th = acos(clamp(dot(pd, c), -1.0, 1.0)), tl = length(tv);
+            float cph = tl > 1.0e-4 ? dot(tv, sp)/tl : 1.0, ph = tl > 1.0e-4 ? atan(dot(tv, e2), dot(tv, sp)) : 0.0;
+            float night = 0.15 + 0.85*smoothstep(-0.5, 0.7, -cph);
+            vec3 x = (vec3(th - grow) - vec3(0.349,
+                        0.318 + 0.012*sin(3.0*ph + 1.0 + uOff.x*9.0) + 0.006*sin(8.0*ph + uOff.y*14.0) + 0.0025*sin(19.0*ph + 2.0 + uOff.z*25.0),
+                        0.290 + 0.010*sin(4.0*ph + 4.0 - uOff.y*8.0) + 0.006*sin(9.0*ph + 1.0 + uOff.z*12.0) + 0.0025*sin(23.0*ph - uOff.x*21.0)))/wid;
+            vec3 g = night*vec3(1.0, 0.6 + 0.4*sin(5.0*ph + uOff.x*30.0), 0.6 + 0.4*sin(7.0*ph + 2.0 - uOff.y*26.0));
+            if (j > 0){
+              float dl = len/float(NI);
+              for (int m = 0; m < 3; m++){
+                vec2 sf = sheet(xp[m], x[m]);
+                if (sf.x < 1.0e-5) continue;
+                float hk = (length(ro + rd*(t - dl*(1.0 - sf.y))) - 1.0)/KM;
+                aurL += amp[m]*mix(gp[m], g[m], sf.y)*sf.x*(dl/KM)*aurP(hk);
+              }
+            }
+            xp = x; gp = g;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- composite ----
+  vec3 Lunder = mix(Lbg, Lg, cov);
+  vec3 Tup = Tv + (1.0 - Tv)*0.45*cov;               // light scattered toward the eye from neighbouring ground
+  vec3 col = inS + Tup*Lunder + (1.0 - cov)*Lsun;
+  vec3 Tc0 = pow(Tv, vec3(0.45));
+  vec3 colC = inS*0.55 + (Tc0 + (1.0 - Tc0)*0.45)*Lc;
+  col = mix(col, colC, cloudA);
+  vec3 Lgreen = vec3(0.45, 1.0, 0.22)/0.827*(3.5e-5*ag + 1.94e-4*aurL);   // (1 kilorayleigh of the green line is 1.94e-4 cd/m²)
+  col += Lgreen;
+  float Ygreen = lum(Lgreen), Ycity = lum(Tup*Lcity)*cov*(1.0 - cloudA);
+  if (uEmoon > 0.0 && hit){                                  // moonlight scattered by the air toward the eye
+    vec3 md = normalize(uMoon - p); float num = dot(rd, md);
+    float pR = 3.0/(16.0*PI)*(1.0 + num*num);
+    float pM = 3.0*(1.0-g*g)*(1.0+num*num)/(8.0*PI*(2.0+g*g)*pow(1.0+g*g-2.0*g*num, 1.5));
+    float am = min(chap(1.0/HR, max(dot(n, -rd), 0.02)), 40.0);
+    vec3 tv = BR*HR*am; float tvm = BMS*HM*min(chap(1.0/HM, max(dot(n,-rd),0.02)), 40.0);
+    col += uEmoon*(pR*BR*HR + pM*BMS*HM)*am*(1.0 - exp(-tv - tvm))/(tv + tvm)
+         *transCos(1.0, 0.0, max(dot(n, md), 0.02))*smoothstep(-0.02, 0.05, dot(n, md))*cov;
+  }
+  if (moonFront) col = Lmoon;
+  // veiling glare of the eye from the Sun and Moon (only when they are in view)
+  if (uMode == 0) for (int i = 0; i < 40; i++){ if (i >= uGn) break; col += uGc[i]*glare(angBetween(rd, uGd[i].xyz), uGd[i].w); }
+
+  if (any(isnan(col)) || any(isinf(col))){ if (uNoCloud > 1.5) { outColor = vec4(1.0, 0.0, 1.0, 1.0); return; } col = vec3(0.0); }   // guard against degenerate geometry
+  float Y = lum(col);
+  if (uMode == 1){
+    float e = clamp((log2(max(Y, 1e-9)) + 30.0)/60.0, 0.0, 1.0)*65535.0;
+    float lw = mix(Lw*cov, LwC, cloudA);
+    if (mD > 0.0 && LwM > 0.0 && (moonFront || !hit)) lw = LwM;
+    float w = lw > 1e-6 ? clamp((log2(lw) + 30.0)/60.0, 1.0/65535.0, 1.0)*65535.0 : 0.0;
+    outColor = vec4(floor(e/256.0)/255.0, mod(e, 256.0)/255.0, floor(w/256.0)/255.0, mod(w, 256.0)/255.0);
+    return;
+  }
+  // ---- photoreceptor response (Naka-Rushton) + mesopic/scotopic shift ----
+  // Display: brightness proportional to the scene relative to the adapted white (W = 0.85 x a white
+  // surface in daylight), soft roll-off for highlights, hue kept, then sRGB-encoded for the screen -
+  // the same way calibrated true-colour images (DSCOVR/EPIC, Apollo) are made.
+  float W = uSigma*5.67 - uBlack;
+  float Yall = lum(col);
+  col = max(col - vec3(uBlack), 0.0); Y = lum(col);
+  float yy = max(Y, 0.0)/W;
+  float d = yy < 0.8 ? yy : 0.8 + 0.2*(1.0 - exp(-(yy - 0.8)/0.2));
+  vec3 c = Y > 0.0 ? max(col, 0.0)/Y*d : vec3(0.0);
+  float mx = max(c.r, max(c.g, c.b));
+  if (mx > 1.0) c = mix(c/mx, vec3(1.0), min(1.0, (mx - 1.0)*0.12));   // (a light brighter than the screen's white keeps its hue until far brighter)
+  // rods take over below ~3 cd/m² and colour vision is gone near 0.003; bright points (city lights) keep colour
+  // (A pure-coloured light - the aurora's green line, a sodium lamp - shows its hue at about a sixth of the brightness
+  // a pale surface colour needs: an aurora is whitish at 1 kilorayleigh, faintly green at 10, plainly green at 100.)
+  float pure = clamp((Ygreen + Ycity)/max(Yall, 1.0e-9), 0.0, 1.0);
+  float rod = clamp((log(3.0) - log(max(Y*(1.0 + 5.0*pure), 1e-9)))/log(1000.0), 0.0, 0.92);
+  // ...but how much the rods add depends on the light. For the same brightness they respond about half as strongly
+  // to the aurora's green line, and a quarter as strongly to street lighting, as to white light - so those keep
+  // their colour at levels where a moonlit cloud has lost it. (Photographs show both far more vivid than the eye.)
+  float dull = clamp((0.54*Ygreen + 0.72*Ycity)/max(Yall, 1.0e-9), 0.0, 0.8);
+  float ar = rod*(1.0 - dull), ac = 1.0 - rod;
+  // What the rods add is colourless - seen as faintly blue for ordinary light, as plain pale grey for the green line.
+  c = mix(c, vec3(d)*mix(vec3(0.86, 0.95, 1.12), vec3(0.94, 1.03, 0.95), clamp(Ygreen/max(Yall, 1.0e-9), 0.0, 1.0)), ar/(ar + ac));
+  c = mix(12.92*c, 1.055*pow(max(c, 0.0), vec3(1.0/2.4)) - 0.055, step(0.0031308, c));   // sRGB
+  c += (hash(vec3(gl_FragCoord.xy, 3.1)) - 0.5)/255.0;       // dither
+  outColor = vec4(clamp(c, 0.0, 1.0), rod);                  // alpha: how much rods (blurry vision) see this
+}`;
+
+/* ------------------------------------------------------------------ stars */
+const SVS = `#version 300 es
+in vec3 aDir; in float aMag; in float aBV;
+uniform mat3 uJ2W; uniform vec3 uCam, uVR, uVU, uVB; uniform float uPix; uniform vec2 uRes;
+uniform float uEth, uPx; uniform vec3 uMoon;
+out vec3 vCol; out float vI;
+const float KM = 1.0/6378.137;
+void hide(){ gl_Position = vec4(2.0,2.0,2.0,1.0); gl_PointSize = 0.0; vI = 0.0; vCol = vec3(0.0); }
+void main(){
+  vec3 d = uJ2W*aDir;
+  float z = -dot(d, uVB);
+  if (z <= 0.0) { hide(); return; }
+  vec2 px = vec2(dot(d,uVR), dot(d,uVU))/z/uPix;
+  float b = dot(uCam, d);
+  if (b < 0.0 && b*b - (dot(uCam,uCam) - 1.0) > 0.0) { hide(); return; }       // behind Earth
+  vec3 oc = uCam - uMoon; float mb = dot(oc,d);
+  if (mb < 0.0 && mb*mb - (dot(oc,oc) - pow(1737.4*KM,2.0)) > 0.0) { hide(); return; } // behind Moon
+  float T = 1.0;                                                            // extinction near the limb
+  if (b < 0.0){
+    float h = length(uCam - d*b) - 1.0;
+    if (h < 100.0*KM){
+      float r = 1.0 + h;
+      float tau = 13.762*6.378137*8.0*KM*exp(-h/(8.0*KM))*2.0*sqrt(1.5708*r/(8.0*KM))
+                + 4.4*6.378137*1.2*KM*exp(-h/(1.2*KM))*2.0*sqrt(1.5708*r/(1.2*KM));
+      T = exp(-tau);
+    }
+  }
+  float E = 2.54e-6*pow(10.0, -0.4*aMag)*T;                                 // illuminance (lux)
+  float dm = 2.5*log(E/uEth)/log(10.0);                                     // magnitudes above eye threshold
+  if (dm <= 0.0) { hide(); return; }
+  gl_Position = vec4(px/(0.5*uRes), 0.0, 1.0);
+  gl_PointSize = (1.1 + 0.42*min(dm, 9.0))*uPx;
+  vI = 1.0 - exp(-0.5*dm);
+  // B-V -> temperature (Ballesteros) -> approximate colour
+  float t = 4600.0*(1.0/(0.92*aBV + 1.7) + 1.0/(0.92*aBV + 0.62));
+  vec3 c = vec3(1.0);
+  c.r = t < 6600.0 ? 1.0 : clamp(1.29*pow(t/100.0 - 60.0, -0.1332), 0.0, 1.0);
+  c.g = t < 6600.0 ? clamp(0.39*log(t/100.0) - 0.631, 0.0, 1.0) : clamp(1.13*pow(t/100.0 - 60.0, -0.0755), 0.0, 1.0);
+  c.b = t >= 6600.0 ? 1.0 : (t < 1900.0 ? 0.0 : clamp(0.543*log(t/100.0 - 10.0) - 1.196, 0.0, 1.0));
+  float sat = clamp((dm - 2.0)/5.0, 0.0, 0.55);                            // faint stars look white
+  vCol = mix(vec3(1.0), c/max(max(c.r,c.g),c.b), sat);
+}`;
+const SFS = `#version 300 es
+precision mediump float;
+in vec3 vCol; in float vI; out vec4 o;
+void main(){ vec2 q = gl_PointCoord - 0.5; float a = exp(-dot(q,q)*14.0); o = vec4(vCol*vI*a, 1.0); }`;
+
+/* ------------------------------------------------------------------ lightning */
+// Seen from orbit at night, thunderstorms flicker: each flash lights a patch of cloud some tens of km across for a
+// fraction of a second. They are drawn as soft glows over the finished picture (like the stars), so they can
+// flicker many times a second without the whole scene being drawn again.
+const LVS = `#version 300 es
+in vec2 aCorner;                              // which corner of the patch
+in vec3 aPos; in float aI; in float aSig;     // place (Earth radii), luminous intensity straight up right now (cd), glow radius (Earth radii)
+uniform vec3 uCam, uVR, uVU, uVB; uniform float uPix, uW; uniform vec2 uRes;
+out vec2 vQ; flat out vec3 vConic; flat out float vL;
+vec2 proj(vec3 r){ return vec2(dot(r, uVR), dot(r, uVU))/max(-dot(r, uVB), 1.0e-6)/uPix; }
+void main(){
+  vec3 r = aPos - uCam; float d = length(r), z = -dot(r, uVB), b = dot(uCam, r)/d, D = b*b - (dot(uCam, uCam) - 1.0);
+  bool behind = b < 0.0 && D > 0.0 && -b - sqrt(max(D, 0.0)) < d - 1.0e-3;       // the globe is in the way
+  vL = 0.0; vConic = vec3(1.0, 0.0, 1.0); vQ = vec2(0.0);
+  if (z <= 1.0e-3*d || aI <= 0.0 || behind){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  // the glow lies flat on the cloud top, so toward the horizon it is seen foreshortened
+  vec3 n = normalize(aPos), e1 = cross(vec3(0.0, 1.0, 0.0), n); e1 /= max(length(e1), 1.0e-4); vec3 e2 = cross(n, e1);
+  vec2 c = proj(r), u1 = proj(r + e1*aSig) - c, u2 = proj(r + e2*aSig) - c;
+  float s0 = max(0.9, 2.0e-4/uPix);             // (never smaller than a pixel, or than the eye can resolve)
+  float A = u1.x*u1.x + u2.x*u2.x + s0*s0, B = u1.x*u1.y + u2.x*u2.y, C = u1.y*u1.y + u2.y*u2.y + s0*s0;
+  float det = max(A*C - B*B, 1.0e-6), m = uPix*d*6378137.0;                    // (m: metres to a pixel, out at the flash)
+  vConic = vec3(C, -B, A)/det;
+  vL = aI*max(dot(n, -r)/d, 0.0)/(6.2832*sqrt(det)*m*m)/uW;                    // luminance, against what the eye takes for white just now
+  vQ = aCorner*11.0*sqrt(0.5*(A + C) + sqrt(0.25*(A - C)*(A - C) + B*B));
+  gl_Position = vec4((c + vQ)/(0.5*uRes), 0.0, 1.0);
+}`;
+const LFS = `#version 300 es
+precision highp float;
+in vec2 vQ; flat in vec3 vConic; flat in float vL; out vec4 o;
+void main(){
+  float md = vConic.x*vQ.x*vQ.x + 2.0*vConic.y*vQ.x*vQ.y + vConic.z*vQ.y*vQ.y;
+  // a bright core, and around it the wider, fainter glow of light that has wandered farther through the cloud
+  float y = vL*(0.6*exp(-0.5*md) + 0.064*exp(-0.08*md))*(1.0 - smoothstep(100.0, 121.0, md));
+  float d = y < 0.8 ? y : 0.8 + 0.2*(1.0 - exp(-(y - 0.8)/0.2));
+  vec3 c = d*vec3(0.86, 0.93, 1.0);                                            // blue-white
+  o = vec4(mix(12.92*c, 1.055*pow(max(c, vec3(0.0)), vec3(1.0/2.4)) - 0.055, step(0.0031308, c)), 1.0);
+}`;
+
+/* ------------------------------------------------------------------ night acuity */
+// Rod vision is blurry: visual acuity falls from ~1' in daylight to ~10' in starlight (Shlaer 1937).
+// The scene is blurred by the extra amount, only where rods are doing the seeing (alpha).
+const CFS = `#version 300 es
+precision highp float;
+uniform sampler2D tScene; uniform vec2 uRes, uSub, uMax, uTexel; uniform float uBlur; out vec4 o;
+const vec2 P[12] = vec2[12](vec2(-0.326,-0.406), vec2(-0.840,-0.074), vec2(-0.696,0.457), vec2(-0.203,0.621),
+  vec2(0.962,-0.195), vec2(0.473,-0.480), vec2(0.519,0.767), vec2(0.185,-0.893), vec2(0.507,0.064),
+  vec2(0.896,0.412), vec2(-0.322,-0.933), vec2(-0.792,-0.598));
+void main(){
+  vec2 uv = min(gl_FragCoord.xy/uRes*uSub, uMax); vec4 c = textureLod(tScene, uv, 0.0);   // (enlarges the scene to the canvas if it was drawn smaller)
+  if (uBlur < 0.25 || c.a < 0.01) { o = vec4(c.rgb, 1.0); return; }
+  // Dim-light (rod) vision is blurry; what is bright enough for the cones stays sharp. A wide blur reads from the
+  // scene's smaller copies, so it is smooth, and bright points do not smear into the dark around them.
+  float lod = max(log2(uBlur*0.55), 0.0); vec2 lim = uMax - exp2(ceil(lod))*uTexel*step(0.001, lod);
+  vec4 t = textureLod(tScene, min(uv, lim), lod); vec3 acc = t.rgb*t.a; float ws = t.a;
+  for (int i = 0; i < 12; i++){ t = textureLod(tScene, min(uv + P[i]*uBlur*uTexel, lim), lod); acc += t.rgb*t.a; ws += t.a; }
+  o = vec4(mix(c.rgb, ws > 0.05 ? acc/ws : c.rgb, c.a), 1.0);
+}`;
+
+/* ------------------------------------------------------------------ GL setup */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {antialias:false, powerPreference:'high-performance', preserveDrawingBuffer:false});
+function sh(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+function program(vs, fs){ const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+const P = program(VS, FS), SP = program(SVS, SFS), CP = program(VS, CFS);
+function locs(p, names){ const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+const U = locs(P, ['uMode','uRes','uPix','uCam','uVR','uVU','uVB','uSun','uEsun','uSunRad','uDec','uMoon','uMX','uMY','uMZ',
+  'uEmoon','uEearth','uW2G','uGd','uGc','uGn','uSigma','uScot','uBlack','uFlow','uOff','uStorm','tDay','tLights','tTopo','tWater','tMoon','tMW','tCloud','tSeason','tLive','tMoonH','tMoonB','uMoonHi','uKp','uEcl','uMonth','uLive','uLiveAge','tRug','uNoCloud','uTexR','uQ']);
+const CU = locs(CP, ['tScene','uRes','uSub','uMax','uTexel','uBlur']);
+const SU = locs(SP, ['uJ2W','uCam','uVR','uVU','uVB','uPix','uRes','uEth','uPx','uMoon']);
+const LP = program(LVS, LFS), LU = locs(LP, ['uCam','uVR','uVU','uVB','uPix','uW','uRes']);
+
+const quadVAO = gl.createVertexArray(); gl.bindVertexArray(quadVAO);
+const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const qa = gl.getAttribLocation(P, 'a'); gl.enableVertexAttribArray(qa); gl.vertexAttribPointer(qa, 2, gl.FLOAT, false, 0, 0);
+
+// luminance framebuffer for eye adaptation
+const lumTex = gl.createTexture(); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, lumTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+const lumFB = gl.createFramebuffer(); let lumW = 0, lumH = 0, lumBuf = null;
+// The small picture is read back through a buffer a frame or two later, so the GPU is never made to stop and wait
+// (a plain read-back stalls every frame it happens in). If a browser cannot do that, the plain read-back is used.
+const lumPBO = gl.createBuffer(); let lumAsync = true, lumChecked = false, lumSync = null, lumCtx = null;
+function ensureLum(w, h){
+  if (w === lumW && h === lumH) return;
+  if (lumSync){ gl.deleteSync(lumSync); lumSync = null; }
+  lumW = w; lumH = h; lumBuf = new Uint8Array(w*h*4);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, lumPBO); gl.bufferData(gl.PIXEL_PACK_BUFFER, w*h*4, gl.STREAM_READ); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, lumTex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lumFB); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lumTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// offscreen scene target for the acuity pass
+const sceneTex = gl.createTexture(); gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const sceneFB = gl.createFramebuffer(); let sceneW = 0, sceneH = 0;
+function ensureScene(w, h){
+  if (w === sceneW && h === sceneH) return; sceneW = w; sceneH = h;
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.generateMipmap(gl.TEXTURE_2D);                       // (the smaller copies are what dim-light vision's blur reads)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFB); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+let lowMem = false; try { lowMem = localStorage.getItem('earthLowMem') === '1'; } catch(e){}
+const big = !lowMem && gl.getParameter(gl.MAX_TEXTURE_SIZE) >= 8192 && (navigator.deviceMemory === undefined || navigator.deviceMemory >= 4);
+// If the phone reclaims GPU memory, the canvas would go black for good: reload with the lighter 4K images.
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault();
+  try { localStorage.setItem('earthLowMem', '1'); } catch(_){}
+  setTimeout(() => location.reload(), 300); });
+function loadTex(unit, url, uname, gray, maxW){
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => {
+      const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      let src = img;
+      if (maxW && img.width > maxW){                        // lighter copy for phones short of graphics memory
+        src = document.createElement('canvas'); src.width = maxW; src.height = Math.round(img.height*maxW/img.width);
+        src.getContext('2d').drawImage(img, 0, 0, src.width, src.height);
+      }
+      if (gray) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, src);
+      else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE, src);
+      if (uname === 'tTopo'){ gl.useProgram(P); gl.uniform1f(U.uTexR, src.width/(2*Math.PI)); }
+      if (uname === 'tCloud' || uname === 'tWater') keepSmall(uname, img);
+      if (uname === 'tCloud' || uname === 'tWater' || uname === 'tTopo') rawImgs[uname] = img;
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, 8);
+      gl.useProgram(P); gl.uniform1i(U[uname], unit); res();
+    };
+    img.onerror = rej; img.src = url;
+  });
+}
+
+/* ------------------------------------------------------------------ vector helpers */
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]], sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], sc=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2], len=a=>Math.hypot(a[0],a[1],a[2]), norm=a=>sc(a,1/len(a));
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+function rot(v, k, ang){ const c=Math.cos(ang), s=Math.sin(ang); return add(add(sc(v,c), sc(cross(k,v),s)), sc(k, dot(k,v)*(1-c))); }
+const angBetween=(a,b)=>2*Math.asin(Math.min(1, len(sub(a,b))/2));
+const mulMV=(M,v)=>[M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]];
+const mulMM=(A,B)=>A.map(r=>[0,1,2].map(j=>r[0]*B[0][j]+r[1]*B[1][j]+r[2]*B[2][j]));
+const T3=M=>[[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]];
+const glMat=M=>new Float32Array([M[0][0],M[1][0],M[2][0], M[0][1],M[1][1],M[2][1], M[0][2],M[1][2],M[2][2]]); // row-major -> GL column-major
+function overlapFrac(r1, r2, d){
+  if (d >= r1 + r2) return 0; if (d <= Math.abs(r2 - r1)) return r2 >= r1 ? 1 : (r2*r2)/(r1*r1);
+  const a = r1*r1*Math.acos((d*d+r1*r1-r2*r2)/(2*d*r1)) + r2*r2*Math.acos((d*d+r2*r2-r1*r1)/(2*d*r2))
+          - 0.5*Math.sqrt(Math.max(0,(-d+r1+r2)*(d+r1-r2)*(d-r1+r2)*(d+r1+r2)));
+  return a/(Math.PI*r1*r1);
+}
+
+/* ------------------------------------------------------------------ astronomy */
+const D2R = Math.PI/180, AU_ER = 149597870.7/6378.137;
+const rev = x => ((x % 360) + 360) % 360;
+function kepler(Mdeg, e){ let M = rev(Mdeg)*D2R, E = M + e*Math.sin(M)*(1 + e*Math.cos(M));
+  for (let i = 0; i < 6; i++) E -= (E - e*Math.sin(E) - M)/(1 - e*Math.cos(E)); return E; }
+// IAU 1976 precession matrix, J2000 equatorial -> mean equatorial of date
+function precession(T){
+  const as = D2R/3600;
+  const z1 = (2306.2181*T + 0.30188*T*T + 0.017998*T*T*T)*as;
+  const z2 = (2306.2181*T + 1.09468*T*T + 0.018203*T*T*T)*as;
+  const th = (2004.3109*T - 0.42665*T*T - 0.041833*T*T*T)*as;
+  const cz=Math.cos(z1), sz=Math.sin(z1), cZ=Math.cos(z2), sZ=Math.sin(z2), ct=Math.cos(th), st=Math.sin(th);
+  return [[cz*ct*cZ - sz*sZ, -sz*ct*cZ - cz*sZ, -st*cZ],
+          [cz*ct*sZ + sz*cZ, -sz*ct*sZ + cz*cZ, -st*sZ],
+          [cz*st,            -sz*st,             ct  ]];
+}
+// JPL approximate Keplerian elements (Standish), valid 1800-2050; J2000 ecliptic
+const PLANETS = {
+  mercury:[0.38709927,0.00000037, 0.20563593,0.00001906, 7.00497902,-0.00594749, 252.25032350,149472.67411175, 77.45779628,0.16047689, 48.33076593,-0.12534081],
+  venus:  [0.72333566,0.00000390, 0.00677672,-0.00004107, 3.39467605,-0.00078890, 181.97909950,58517.81538729, 131.60246718,0.00268329, 76.67984255,-0.27769418],
+  earth:  [1.00000261,0.00000562, 0.01671123,-0.00004392, -0.00001531,-0.01294668, 100.46457166,35999.37244981, 102.93768193,0.32327364, 0.0,0.0],
+  mars:   [1.52371034,0.00001847, 0.09339410,0.00007882, 1.84969142,-0.00813131, -4.55343205,19140.30268499, -23.94362959,0.44441088, 49.55953891,-0.29257343],
+  jupiter:[5.20288700,-0.00011607, 0.04838624,-0.00013253, 1.30439695,-0.00183714, 34.39644051,3034.74612775, 14.72847983,0.21252668, 100.47390909,0.20469106],
+  saturn: [9.53667594,-0.00125060, 0.05386179,-0.00050991, 2.48599187,0.00193609, 49.95424423,1222.49362201, 92.59887831,-0.41897216, 113.66242448,-0.28867794],
+  uranus: [19.18916464,-0.00196176, 0.04725744,-0.00004397, 0.77263783,-0.00242939, 313.23810451,428.48202785, 170.95427630,0.40805281, 74.01692503,0.04240589],
+};
+function helio(el, T){
+  const a = el[0]+el[1]*T, e = el[2]+el[3]*T, I = (el[4]+el[5]*T)*D2R, L = el[6]+el[7]*T, wb = el[8]+el[9]*T, Om = el[10]+el[11]*T;
+  const w = (wb - Om)*D2R, O = Om*D2R, E = kepler(L - wb, e);
+  const xp = a*(Math.cos(E) - e), yp = a*Math.sqrt(1 - e*e)*Math.sin(E);
+  const cw=Math.cos(w), sw=Math.sin(w), cO=Math.cos(O), sO=Math.sin(O), cI=Math.cos(I), sI=Math.sin(I);
+  return [(cw*cO - sw*sO*cI)*xp + (-sw*cO - cw*sO*cI)*yp,
+          (cw*sO + sw*cO*cI)*xp + (-sw*sO + cw*cO*cI)*yp,
+          (sw*sI)*xp + (cw*sI)*yp];
+}
+const EPS0 = 23.43928*D2R;
+const ecl2eqJ = v => [v[0], v[1]*Math.cos(EPS0) - v[2]*Math.sin(EPS0), v[1]*Math.sin(EPS0) + v[2]*Math.cos(EPS0)];
+function planetMag(name, r, D, a){            // Mallama & Hilton 2018 (simplified)
+  const k = 5*Math.log10(r*D);
+  switch(name){
+    case 'mercury': return -0.613 + 6.328e-2*a - 1.6336e-3*a*a + 3.3644e-5*a**3 - 3.4265e-7*a**4 + 1.6893e-9*a**5 - 3.0334e-12*a**6 + k;
+    case 'venus':   return (a < 163.7 ? -4.384 - 1.044e-3*a + 3.687e-4*a*a - 2.814e-6*a**3 + 8.938e-9*a**4 : 236.05828 - 2.81914*a + 8.39034e-3*a*a) + k;
+    case 'mars':    return -1.601 + 2.267e-2*a - 1.302e-4*a*a + k;
+    case 'jupiter': return -9.395 - 3.7e-4*a + 6.16e-4*a*a + k;
+    case 'saturn':  return -8.88 + 0.044*a + k;
+    case 'uranus':  return -7.110 + 6.587e-3*a + 1.045e-4*a*a + k;
+  }
+}
+const GAL = [[-0.0548755604,-0.8734370902,-0.4838350155],[0.4941094279,-0.4448296300,0.7469822445],[-0.8676661490,-0.1980763734,0.4559837762]];
+
+function astro(ms){
+  const JD = ms/86400000 + 2440587.5, T = (JD - 2451545)/36525, d = JD - 2451543.5;
+  const gmst = rev(280.46061837 + 360.98564736629*(JD - 2451545) + 0.000387933*T*T - T*T*T/38710000)*D2R;
+  const cg = Math.cos(gmst), sg = Math.sin(gmst);
+  const eqToWorld = v => { const Xe = cg*v[0] + sg*v[1], Ye = -sg*v[0] + cg*v[1]; return [Ye, v[2], Xe]; };
+  const eps = (23.4393 - 3.563e-7*d)*D2R;
+  const eclToEq = v => [v[0], v[1]*Math.cos(eps) - v[2]*Math.sin(eps), v[1]*Math.sin(eps) + v[2]*Math.cos(eps)];
+
+  // Sun (elements of date)
+  const ws = 282.9404 + 4.70935e-5*d, es = 0.016709 - 1.151e-9*d, Ms = 356.0470 + 0.9856002585*d;
+  const Es = kepler(Ms, es), xv = Math.cos(Es) - es, yv = Math.sqrt(1 - es*es)*Math.sin(Es);
+  const rs = Math.hypot(xv, yv), lonS = Math.atan2(yv, xv) + ws*D2R;
+  const sunEq = eclToEq([Math.cos(lonS), Math.sin(lonS), 0]);
+  const sun = norm(eqToWorld(sunEq));
+  const decS = Math.asin(sunEq[2])/D2R;
+
+  // Moon (Schlyter: elements of date + main perturbations)
+  const N = 125.1228 - 0.0529538083*d, inc = 5.1454*D2R, w = 318.0634 + 0.1643573223*d, a = 60.2666, e = 0.054900;
+  const M = 115.3654 + 13.0649929509*d;
+  const E = kepler(M, e);
+  const mx = a*(Math.cos(E) - e), my = a*Math.sqrt(1 - e*e)*Math.sin(E);
+  let r = Math.hypot(mx, my); const vv = Math.atan2(my, mx);
+  const No = N*D2R, vw = vv + w*D2R;
+  const xh = r*(Math.cos(No)*Math.cos(vw) - Math.sin(No)*Math.sin(vw)*Math.cos(inc));
+  const yh = r*(Math.sin(No)*Math.cos(vw) + Math.cos(No)*Math.sin(vw)*Math.cos(inc));
+  const zh = r*Math.sin(vw)*Math.sin(inc);
+  let lonM = Math.atan2(yh, xh)/D2R, latM = Math.atan2(zh, Math.hypot(xh, yh))/D2R;
+  const Ls = Ms + ws, Lm = M + w + N, Dm = (Lm - Ls)*D2R, F = (Lm - N)*D2R, Mm = M*D2R, Msr = Ms*D2R;
+  lonM += -1.274*Math.sin(Mm - 2*Dm) + 0.658*Math.sin(2*Dm) - 0.186*Math.sin(Msr) - 0.059*Math.sin(2*Mm - 2*Dm)
+        - 0.057*Math.sin(Mm - 2*Dm + Msr) + 0.053*Math.sin(Mm + 2*Dm) + 0.046*Math.sin(2*Dm - Msr) + 0.041*Math.sin(Mm - Msr)
+        - 0.035*Math.sin(Dm) - 0.031*Math.sin(Mm + Msr) - 0.015*Math.sin(2*F - 2*Dm) + 0.011*Math.sin(Mm - 4*Dm);
+  latM += -0.173*Math.sin(F - 2*Dm) - 0.055*Math.sin(Mm - F - 2*Dm) - 0.046*Math.sin(Mm + F - 2*Dm) + 0.033*Math.sin(F + 2*Dm) + 0.017*Math.sin(2*Mm + F);
+  r += -0.58*Math.cos(Mm - 2*Dm) - 0.46*Math.cos(2*Dm);
+  const lo = lonM*D2R, la = latM*D2R;
+  const moon = sc(eqToWorld(eclToEq([Math.cos(la)*Math.cos(lo), Math.cos(la)*Math.sin(lo), Math.sin(la)])), r);
+  // lunar body axes: prime meridian faces the mean Earth direction (gives optical libration in longitude)
+  const lmr = rev(Lm)*D2R;
+  const mz = norm(sc(eqToWorld(eclToEq([Math.cos(lmr), Math.sin(lmr), 0])), -1));
+  let my_ = eqToWorld(eclToEq([0, 0, 1]));
+  my_ = norm(sub(my_, sc(mz, dot(my_, mz))));
+  const mxv = cross(my_, mz);
+
+  // illuminances
+  const Esun = 128000/(rs*rs);
+  const mHat = norm(moon);
+  const alphaM = Math.acos(Math.max(-1, Math.min(1, dot(sun, sc(mHat,-1)))))/D2R;   // lunar phase angle
+  const magM = -12.73 + 0.026*alphaM + 4e-9*alphaM**4 + 5*Math.log10(r/60.27);
+  const Emoon = 128000*Math.pow(10, -0.4*(magM + 26.74));
+  const alphaE = Math.acos(Math.max(-1, Math.min(1, dot(sun, mHat))));               // Earth's phase seen from Moon
+  const phiE = (Math.sin(alphaE) + (Math.PI - alphaE)*Math.cos(alphaE))/Math.PI;
+  const Eearth = (2/3)*0.30*Esun*phiE/(r*r);
+  const sunRad = Math.asin(696000/(rs*149597870.7));
+
+  // frames for stars / planets / galaxy
+  const Pm = precession(T);
+  const J2W = [0,1,2].map(i => eqToWorld([Pm[0][i], Pm[1][i], Pm[2][i]]));   // columns
+  const J2Wr = T3(J2W);                                                        // as row-major matrix
+  const W2G = mulMM(GAL, T3(J2Wr));
+  const ecl = mulMV(J2Wr, [0, -Math.sin(23.4393*D2R), Math.cos(23.4393*D2R)]);   // north pole of the ecliptic
+
+  // planets (geocentric, J2000 equatorial directions)
+  const eb = helio(PLANETS.earth, T), planets = [];
+  for (const name of ['mercury','venus','mars','jupiter','saturn','uranus']){
+    const ph = helio(PLANETS[name], T), g = sub(ph, eb);
+    const rr = len(ph), DD = len(g);
+    const ca = dot(sc(ph,-1), sub(eb, ph))/(rr*len(sub(eb,ph)));
+    const al = Math.acos(Math.max(-1, Math.min(1, ca)))/D2R;
+    planets.push({dir: norm(ecl2eqJ(g)), mag: planetMag(name, rr, DD, al), bv: {mercury:0.93,venus:0.82,mars:1.36,jupiter:0.83,saturn:1.04,uranus:0.56}[name]});
+  }
+  return { sun, decS, Esun, sunRad, moon, mx: mxv, my: my_, mz, Emoon, Eearth, J2Wr, W2G, ecl, planets };
+}
+
+/* ------------------------------------------------------------------ generated weather */
+function h1(x){ const s = Math.sin(x*127.1 + 311.7)*43758.5453; return s - Math.floor(s); }
+const PERIOD = 3;
+function weather(ms){
+  const T = ms/3600000, c = T/PERIOD, c2 = c + 0.5;
+  const flow = [c - Math.floor(c), c2 - Math.floor(c2), PERIOD, 0];
+  const tt = T % 100000, off = [31.7 + tt*0.011, 12.3 + tt*0.007, 57.1 + tt*0.009];
+  const storms = new Float32Array(32), L = 96;
+  for (let i = 0; i < 8; i++){
+    const a = T + i*L/8, gen = Math.floor(a/L), age = a - gen*L, s = Math.sin(Math.PI*age/L);
+    const hem = h1(gen*7.0 + i) > 0.5 ? 1 : -1;
+    const latD = (36 + 22*h1(gen*13.0 + i*3.0) + 0.05*age)*hem;
+    const lon = h1(gen*17.0 + i*5.0)*2*Math.PI + 0.011*age/Math.cos(latD*D2R);
+    const la = latD*D2R;
+    storms.set([Math.cos(la)*Math.sin(lon), Math.sin(la), Math.cos(la)*Math.cos(lon), s*hem*(0.6 + 0.4*h1(gen*3.1 + i))], i*4);
+  }
+  return { flow, off, storms };
+}
+
+/* ------------------------------------------------------------------ the eye */
+// Angle each CSS pixel covers when the phone is held ~30 cm away, so the screen acts as a true window.
+const coarse = matchMedia('(pointer:coarse)').matches;
+const CSS_PIX = coarse ? 1/(153*11.8) : 1/(96*24);
+const KM = 1/6378.137, MIN_ALT = 13*KM, MAX_ALT = 120;
+let logLa = Math.log10(500), targetLogLa = logLa, freezeLa = false, blackTarget = 0, black = 0, bleach = logLa;
+// Schaefer (1990) threshold illuminance for a point source against background luminance B (cd/m²)
+function eyeThreshold(B){
+  const nL = B/3.183e-6;
+  return nL < 1479 ? 1.706e-9*(1 + Math.sqrt(0.01259*nL))**2 : 4.81e-8*(1 + Math.sqrt(1.26e-6*nL))**2;
+}
+
+/* ------------------------------------------------------------------ camera */
+// An orbit camera: it swings around what it is looking at, like a spacecraft's chase camera.
+// The rig lives in the frame of the body in focus (the Earth, or the Moon after a double tap on it):
+//   R     = [right, forward, up] at the TARGET - the ground point at the centre of the screen
+//   alt   = distance from the eye to the target
+//   pitch = tilt. Up to tiltMax() it swings the eye down around the target, toward the horizon;
+//           past that the eye stays where it is and the gaze lifts off the ground, out into space.
+const RMOON_J = 1737.4*KM, EYJ = 1/(1 - 0.0033528107), TILT_CAP = 1.5;
+let focus = 'earth', R = null, alt = 8, pitch = 0, flight = null, pose = null;
+const bodyRad = () => focus === 'moon' ? RMOON_J : 1;
+const floorAlt = () => focus === 'moon' ? 15*KM : MIN_ALT;                   // lowest the eye may go
+const surfRad = d => focus === 'moon' ? RMOON_J : 1/Math.sqrt(1 + (EYJ*EYJ - 1)*d[1]*d[1]);   // WGS84 ellipsoid
+const ortho = () => { const b = norm(R[2]); const r = norm(cross(R[1], b)); R = [r, cross(b, r), b]; };
+function rotateCam(axis, ang){ R = R.map(v => rot(v, axis, ang)); ortho(); }
+const fitAlt = Rb => { const w = Math.min(canvas.clientWidth, canvas.clientHeight)*CSS_PIX; return Rb*(1/Math.sin(0.42*w) - 1); };
+const defaultAlt = () => fitAlt(bodyRad());
+function northUp(b){ let u = sub([0,1,0], sc(b, b[1])); if (len(u) < 1e-6) u = [0,0,-1];   // exactly over a pole: any heading
+  const up = norm(u); return [cross(up, b), up, b]; }
+function homeBasis(){ const lat = 40.7*D2R, lon = -74.0*D2R; return northUp([Math.cos(lat)*Math.sin(lon), Math.sin(lat), Math.cos(lat)*Math.cos(lon)]); }
+R = homeBasis(); alt = defaultAlt();
+function tiltMax(){                                                         // keeps the eye above floorAlt()
+  const Rb = surfRad(R[2]), c = ((Rb + floorAlt())**2 - Rb*Rb - alt*alt)/(2*Rb*alt);
+  return Math.min(TILT_CAP, c >= 1 ? 0 : Math.acos(Math.max(c, -1)));
+}
+// The body in focus can never be moved off the screen. While its whole disc fits on the screen, all of it stays
+// in view; from closer in, the planet always fills at least the lower 30% of the screen (down the middle).
+// f(p) > 0 while tilt p keeps it so; it only falls as p grows.
+function onScreen(p){
+  const Rb = surfRad(R[2]), th = Math.min(p, tiltMax()), ph = p - th;
+  const D = Math.sqrt(alt*alt + Rb*Rb + 2*alt*Rb*Math.cos(th));             // eye to the body's centre
+  const rho = Math.asin(Math.min(1, Rb/D));                                 // the body's angular radius
+  const gam = Math.asin(Math.min(1, Rb*Math.sin(th)/D));                    // its centre sits this far below the target
+  const hH = Math.atan(canvas.clientHeight/2*CSS_PIX), s0 = 2*Math.min(hH, Math.atan(canvas.clientWidth/2*CSS_PIX));   // half the screen, as angles
+  const k = Math.min(1, Math.max(0, (2*rho - s0)/s0));
+  const need = 2*rho <= s0 ? 2*rho : s0 + (0.6*hH - s0)*k*k*(3 - 2*k);      // how much of it must show above the bottom edge
+  return rho - gam - ph + hH - need;
+}
+const PITCH_CAP = Math.PI*0.98;
+function pitchMax(){
+  if (onScreen(PITCH_CAP) >= 0) return PITCH_CAP;
+  let a = 0, b = PITCH_CAP;
+  for (let i = 0; i < 32; i++){ const m = 0.5*(a + b); if (onScreen(m) >= 0) a = m; else b = m; }
+  return a;
+}
+// Tilting is for low passes only: seen from high up, the planet always sits in the middle of the screen. The tilt
+// allowed grows from none at 1.2 body radii above the ground (Earth: ~7,600 km, where the planet more than fills
+// the screen) to the full range at 0.3 (~1,900 km). Moving away undoes a tilt; coming back down does not redo it.
+const TILT_HI = 1.2, TILT_LO = 0.3;
+function lowness(){ const t = Math.min(1, Math.max(0, Math.log(TILT_HI*bodyRad()/alt)/Math.log(TILT_HI/TILT_LO))); return t*t*(3 - 2*t); }
+const tiltRoom = () => lowness()*pitchMax();                                // the most tilt allowed at this height
+const tiltNow = () => Math.min(pitch, tiltRoom());                          // the tilt in effect
+function rig(){                                                             // eye + view axes in the body's frame
+  const p = tiltNow(), th = Math.min(p, tiltMax()), ph = p - th;
+  const c = Math.cos(th), s = Math.sin(th), cp = Math.cos(ph), sp = Math.sin(ph);
+  const b0 = sub(sc(R[2], c), sc(R[1], s)), u0 = add(sc(R[1], c), sc(R[2], s));
+  return { vr: R[0], vu: add(sc(u0, cp), sc(b0, sp)), vb: sub(sc(b0, cp), sc(u0, sp)), cam: add(sc(R[2], surfRad(R[2])), sc(b0, alt)) };
+}
+const moonM = x => add(add(sc(S.mx, x[0]), sc(S.my, x[1])), sc(S.mz, x[2]));   // Moon frame -> Earth-fixed
+const moonMi = x => [dot(x, S.mx), dot(x, S.my), dot(x, S.mz)];
+const toWorld = g => focus === 'moon' ? { vr: moonM(g.vr), vu: moonM(g.vu), vb: moonM(g.vb), cam: add(S.moon, moonM(g.cam)) } : g;
+function view(){ return pose || toWorld(rig()); }
+let dirty = true, lastInteract = 0;
+function touch(){ dirty = true; lastInteract = performance.now(); }
+
+function setAlt(a){ alt = Math.min(MAX_ALT, Math.max(floorAlt(), a)); pitch = Math.min(pitch, tiltRoom()); }   // nearer or farther (moving away levels a tilt)
+// ---- picking: which ground point is under a screen position (x right, y up, from the centre, CSS px)
+const rayAt = (x, y, g) => ({ o: g.cam, d: norm(sub(add(sc(g.vr, x*CSS_PIX), sc(g.vu, y*CSS_PIX)), g.vb)) });
+function hitBody(ray){
+  const moon = focus === 'moon', Rb = moon ? RMOON_J : 1, k = moon ? 1 : EYJ;
+  const o = [ray.o[0], ray.o[1]*k, ray.o[2]], d = [ray.d[0], ray.d[1]*k, ray.d[2]];
+  const a = dot(d, d), b = dot(o, d), D = b*b - a*(dot(o, o) - Rb*Rb);
+  if (D <= 0) return null;
+  const t = (-b - Math.sqrt(D))/a; if (t <= 0) return null;
+  const p = add(o, sc(d, t));
+  return { dir: norm([p[0], p[1]/k, p[2]]), graze: -dot(p, d)/(Rb*Math.sqrt(a)) };
+}
+const spot = (x, y) => { const h = hitBody(rayAt(x, y, rig())); return h && h.graze > 0.12 ? h.dir : null; };
+const between = (a, b) => { const ax = cross(a, b), s = len(ax); return s < 1e-12 ? null : { axis: sc(ax, 1/s), ang: Math.atan2(s, dot(a, b)) }; };
+const asTurn = v => { const l = len(v); return l < 1e-12 ? null : { axis: sc(v, 1/l), ang: l }; };
+function turn(q){ if (q && q.ang) rotateCam(q.axis, q.ang); return q; }
+// turn the rig about the body's centre until ground point G sits under screen position (x, y)
+function pin(G, x, y){
+  let first = null;
+  for (let i = 0; i < 2; i++){ const P = spot(x, y); if (!P) return first; const q = turn(between(P, G)); if (!i) first = q || { axis: [0,1,0], ang: 0 }; }
+  return first;
+}
+function tiltBy(d){                                    // d > 0: toward the horizon and past it, for as long as the planet stays on screen
+  const tm = tiltMax(), pm = tiltRoom(), k1 = 0.004, k2 = CSS_PIX*1.5;   // per pixel: swinging around the target; looking up
+  let p = Math.min(pitch, pm);
+  if (d > 0){
+    if (p < tm){ const room = (tm - p)/k1; if (d <= room){ p += d*k1; d = 0; } else { p = tm; d -= room; } }
+    p += d*k2;
+  } else {
+    if (p > tm){ const room = (p - tm)/k2; if (-d <= room){ p += d*k2; d = 0; } else { p = tm; d += room; } }
+    p += d*k1;
+  }
+  pitch = Math.min(pm, Math.max(0, p));
+}
+const swingBy = d => rotateCam(R[2], d*(tiltNow() > tiltMax() ? CSS_PIX*1.5 : 0.004));    // circle around the target
+
+// ---- flights
+const ease = t => t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
+function basisTurn(A, B){                              // the single turn that carries basis A onto basis B
+  const M = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i = 0; i < 3; i++) for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) M[r][c] += B[i][r]*A[i][c];
+  const ang = Math.acos(Math.max(-1, Math.min(1, (M[0][0] + M[1][1] + M[2][2] - 1)/2)));
+  const ax = [M[2][1] - M[1][2], M[0][2] - M[2][0], M[1][0] - M[0][1]], l = len(ax);
+  if (l > 1e-6) return { axis: sc(ax, 1/l), ang };
+  if (ang < 1) return { axis: [0,1,0], ang: 0 };
+  const d = [M[0][0], M[1][1], M[2][2]], k = d.indexOf(Math.max(...d));      // half a turn: axis from M + I
+  return { axis: norm([M[0][k] + (k === 0), M[1][k] + (k === 1), M[2][k] + (k === 2)]), ang: Math.PI };
+}
+function flyTo(R1, a1, p1){                             // within the body in focus
+  spin = glide = zoomAnim = wheel = null;                 // (a flight replaces any motion still dying away)
+  const q = basisTurn(R, R1);
+  flight = { R0: R.map(v => v.slice()), q, a0: alt, a1, p0: pitch, p1, t0: performance.now(), dur: 900 + 450*q.ang };
+}
+function crossTo(body, R1, a1, p1){                     // to the other body: the eye's pose is blended through space
+  spin = glide = zoomAnim = wheel = null;
+  flight = { cross: true, from: view(), body, R1, a1, p1, t0: performance.now(), dur: 3800 };
+}
+function endFlight(){
+  if (flight && flight.cross){ focus = flight.body; R = flight.R1; alt = flight.a1; pitch = flight.p1; }
+  flight = null; pose = null; touch();
+}
+function stepFlight(now){
+  const f = flight, t = Math.min(1, (now - f.t0)/f.dur), e = ease(t);
+  if (f.cross){
+    if (t >= 1) return endFlight();
+    const keep = [focus, R, alt, pitch]; [focus, R, alt, pitch] = [f.body, f.R1, f.a1, f.p1];
+    const to = toWorld(rig()); [focus, R, alt, pitch] = keep;
+    const a = f.from.cam, b = to.cam; let cam = add(sc(a, 1 - e), sc(b, e));
+    for (const [C, Rb] of [[[0,0,0], 1], [S.moon, RMOON_J]]){             // never through a body: slide around it
+      const safe = Math.min(1.25*Rb, (1 - e)*len(sub(a, C)) + e*len(sub(b, C))), off = sub(cam, C), d = len(off);
+      if (d < safe) cam = add(C, sc(d > 1e-9 ? sc(off, 1/d) : [0,1,0], safe));
+    }
+    const A = [f.from.vr, f.from.vu, f.from.vb], q = basisTurn(A, [to.vr, to.vu, to.vb]);
+    const B = A.map(v => rot(v, q.axis, q.ang*e));
+    pose = { vr: B[0], vu: B[1], vb: B[2], cam };
+  } else {
+    R = f.R0.map(v => rot(v, f.q.axis, f.q.ang*e)); ortho();
+    const hump = bodyRad()*1.2*Math.sin(f.q.ang/2)**2*Math.sin(Math.PI*e);   // long hops pull out on the way
+    alt = Math.min(MAX_ALT, Math.exp(Math.log(f.a0)*(1 - e) + Math.log(f.a1)*e) + hump);
+    pitch = f.p0 + (f.p1 - f.p0)*e;
+    if (t >= 1) flight = null;
+  }
+  touch();
+}
+function goHome(){
+  if (focus !== 'earth') crossTo('earth', homeBasis(), fitAlt(1), 0); else flyTo(homeBasis(), defaultAlt(), 0);
+}
+function moonArrival(){        // over the Moon's far limb, looking back past its horizon at the Earth
+  const e = norm(moonMi(sc(S.moon, -1)));                                    // where the Earth really is (libration included)
+  const s = moonMi(S.sun); let side = sub(s, sc(e, dot(s, e)));              // toward the sunlit side
+  side = len(side) > 1e-3 ? norm(side) : norm(cross(e, [0,1,0]));
+  const g = 101.7*D2R, T = add(sc(e, Math.cos(g)), sc(side, Math.sin(g)));
+  const f = norm(sub(e, sc(T, dot(T, e))));                                  // forward along the ground, toward the Earth
+  return [cross(f, T), f, T];
+}
+function doubleTap(x, y){
+  const v = view(), d = norm(sub(add(sc(v.vr, x*CSS_PIX), sc(v.vu, y*CSS_PIX)), v.vb)), tol = 22*CSS_PIX;
+  const hits = (C, Rb) => { const oc = sub(C, v.cam), dist = len(oc); return angBetween(d, sc(oc, 1/dist)) < Math.max(Math.asin(Math.min(1, Rb/dist)), tol); };
+  const h = hitBody(rayAt(x, y, rig()));
+  if (h){                                              // a spot on the body in focus: one step nearer, about that spot
+    zoomStep(0.5, x, y);
+  } else if (focus === 'earth' && hits(S.moon, RMOON_J)) crossTo('moon', moonArrival(), 0.45*RMOON_J, 68*D2R);
+  else if (focus === 'moon' && hits([0,0,0], 1)) crossTo('earth', northUp(norm(v.cam)), fitAlt(1), 0);
+  else goHome();
+}
+
+/* ------------------------------------------------------------------ gestures */
+// The fingers hold the globe.
+//   1 finger: drag - the spot under it follows (a flick keeps the globe turning)
+//   2 fingers: drag - the spot between them follows · pinch - nearer / farther about that spot · twist - turn about
+//       it, all at once and from the first pixel · tap with both - one step farther
+//       (on the sky: the stars between them follow)
+//   2 fingers straight down / up, when low enough: tilt toward the horizon / back to straight down
+//   double tap: one step nearer about that spot (hold the second tap and drag up / down: zoom with one finger) · on the Moon (or the Earth, from the Moon): go there · on empty space: home
+const pts = new Map();
+let grab = null, skyGrab = null, spin = null, lastTap = 0, lastTapPos = null, tapStart = null;
+let pair0 = null, prevPair = null;
+const pending = new Set();                                // fingers that have moved since the two-finger gesture was last acted on
+let mode2 = 'free';                                       // two fingers: 'free' (drag + pinch + twist), 'tilt', or '?' (not yet clear which)
+let one = null;                                           // the one-finger gesture in progress
+let lifted = false;                                       // a two-finger gesture has just ended with one finger still down
+let zoomAnim = null;                                      // a zoom step easing in or out (double tap, two-finger tap)
+let glide = null;                                         // a pinch let go while still moving carries on a little
+let quick = null;                                         // one-handed zoom: the second tap of a double tap, held and dragged
+let twoTap = null;                                        // a two-finger tap in the making
+let wheel = null;                                         // a mouse-wheel or trackpad zoom, easing to where it was sent
+const sx = e => e.clientX - canvas.clientWidth/2, sy = e => canvas.clientHeight/2 - e.clientY;
+const angDiff = (a, b) => { let d = a - b; if (d > Math.PI) d -= 2*Math.PI; if (d < -Math.PI) d += 2*Math.PI; return d; };
+function pair(){ const [a, b] = [...pts.values()];
+  return { cx: (a.x + b.x)/2, cy: (a.y + b.y)/2, d: Math.hypot(b.x - a.x, b.y - a.y), ang: Math.atan2(b.y - a.y, b.x - a.x) }; }
+function stopMotion(){ spin = null; zoomAnim = glide = wheel = null; if (flight) endFlight(); }
+function grabAt(x, y){ const r = rayAt(x, y, rig()); grab = spot(x, y); skyGrab = !grab && !hitBody(r) ? r.d : null; }
+function slide(x, y, dx, dy){                           // the grab point moved by (dx, dy) px to screen position (x, y)
+  // on the sky: a pure turn about the body's centre that keeps the same stars under the fingers.
+  // on ground too close to the horizon to grab (or after sliding off the edge): move over the ground at the target's pace
+  if (skyGrab) return turn(between(rayAt(x, y, rig()).d, skyGrab));
+  const k = CSS_PIX*Math.min(alt/bodyRad(), 6);
+  return turn(asTurn(add(sc(R[1], -dx*k), sc(R[0], dy*k))));
+}
+let trail = [];                                         // where the hold has been over the last ~0.1 s
+function drag(x, y, dx, dy, t){                         // carry the held spot to (x, y)
+  if (grab && !pin(grab, x, y)) grab = null;
+  if (!grab) slide(x, y, dx, dy);
+  trail.push({ t, x, y, R: R.map(v => v.slice()), la: Math.log(alt), G: grab });
+  while (trail.length > 2 && t - trail[0].t > 120) trail.shift();
+}
+function flick(t, patience){                            // letting go while still moving: the motion carries on and dies away
+  spin = null; glide = null;
+  const a = trail[0], b = trail[trail.length - 1]; trail = [];
+  if (!a || t - b.t > patience || b.t - a.t < 8) return;
+  const dt = b.t - a.t, zr = (b.la - a.la)/dt;
+  // a pinch faster than ~30% a second glides on a little (at most about 1.5x further) about the same spot
+  if (Math.abs(zr) > 3e-4){ glide = { rate: Math.max(-0.004, Math.min(0.004, zr)), G: b.G, x: b.x, y: b.y }; return; }
+  if (Math.hypot(b.x - a.x, b.y - a.y)/dt < 0.15) return;                  // a drag slower than 150 px/s just stops
+  const q = basisTurn(a.R, R);
+  if (q && q.ang) spin = { axis: q.axis, w: q.ang/dt };
+}
+// ---- Zooming works the way it does in Apple Maps: always about the point under the fingers, which stays under
+// them (pinch, double tap to step in, two-finger tap to step out, double-tap-and-drag with one finger, and a pinch
+// let go on the move glides on). Unlike Apple Maps nothing snaps back to north-up: the globe keeps whatever
+// orientation it has.
+function zoomStep(f, x, y){                             // one eased step nearer (f < 1) or farther about screen point (x, y)
+  const a1 = Math.min(MAX_ALT, Math.max(floorAlt(), alt*f));
+  zoomAnim = { G: spot(x, y), x, y, la0: Math.log(alt), la1: Math.log(a1), t0: performance.now(), dur: 280 };
+  touch();
+}
+function stepZoom(now){                                 // per frame: zoom steps and the glide after a pinch
+  if (zoomAnim){
+    const z = zoomAnim, t = Math.min(1, Math.max(0, (now - z.t0)/z.dur)), e = 1 - Math.pow(1 - t, 3);
+    setAlt(Math.exp(z.la0 + (z.la1 - z.la0)*e));
+    if (z.G && !pin(z.G, z.x, z.y)) z.G = null;
+    touch(); if (t >= 1) zoomAnim = null;
+  }
+  if (wheel){
+    const dtf = Math.min(100, lastFrame ? now - lastFrame : 16), la = Math.log(alt);
+    const nl = Math.abs(wheel.la - la) < 1e-3 ? wheel.la : la + (wheel.la - la)*(1 - Math.exp(-dtf/55));
+    setAlt(Math.exp(nl));
+    if (wheel.G && !pin(wheel.G, wheel.x, wheel.y)) wheel.G = null;
+    touch(); if (nl === wheel.la) wheel = null;
+  }
+  if (glide && !pts.size){
+    const dtf = Math.min(100, lastFrame ? now - lastFrame : 16), a0 = alt;
+    setAlt(alt*Math.exp(glide.rate*dtf));
+    if (glide.G && !pin(glide.G, glide.x, glide.y)) glide.G = null;
+    glide.rate *= Math.pow(0.85, dtf/16); touch();
+    if (Math.abs(glide.rate) < 2e-5 || alt === a0) glide = null;
+  }
+}
+function pairStep(now){                                 // act on where the two fingers are now
+  pending.clear();
+  if (pts.size !== 2 || !prevPair) return;
+  const q = pair();
+  if (mode2 === '?'){
+    // Low enough to tilt: two fingers moving straight down (or up) side by side tilt the view; anything else
+    // drags, pinches and twists as usual. Which it is shows within the first few pixels; nothing is lost meanwhile.
+    const [a, b] = [...pts.values()], ax = a.x - a.x0, ay = a.y - a.y0, bx = b.x - b.x0, by = b.y - b.y0;
+    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    if (Math.max(la, lb) < 10) return;
+    const together = Math.min(la, lb) > 0.4*Math.max(la, lb) && ay*by > 0 && Math.abs(ay) > 1.7*Math.abs(ax) && Math.abs(by) > 1.7*Math.abs(bx)
+      && Math.hypot(ax - bx, ay - by) < 0.5*Math.max(la, lb);
+    const t = tiltNow(), canTilt = ay < 0 ? t < tiltRoom() - 1e-4 : t > 1e-4;          // down: toward the horizon; up: back
+    mode2 = together && canTilt ? 'tilt' : 'free';
+  }
+  if (mode2 === 'tilt'){ tiltBy(prevPair.cy - q.cy); trail = []; prevPair = q; return; }
+  const da = angDiff(q.ang, prevPair.ang);
+  if (!grab && !skyGrab) grabAt(prevPair.cx, prevPair.cy);        // (after slipping off the edge of the globe: take hold again)
+  // pinch: nearer / farther by exactly as much as the fingers spread, about the spot between them, which stays
+  // between them (drag() below keeps it there)
+  if (q.d > 0 && prevPair.d > 0) setAlt(alt*prevPair.d/q.d);
+  // twist: the globe turns with the fingers, about the spot between them (seen at a slant, the ground there must
+  // turn a little more for what is on the screen to keep up with the fingers)
+  if (da){
+    if (grab) turn({ axis: grab, ang: -da/Math.max(0.35, -dot(grab, rayAt(prevPair.cx, prevPair.cy, rig()).d)) });
+    else rotateCam(R[2], -da);
+  }
+  drag(q.cx, q.cy, q.cx - prevPair.cx, q.cy - prevPair.cy, now);
+  prevPair = q;
+}
+// Mouse: drag holds the globe, shift-drag (or right-drag) tilts and circles, wheel moves in and out.
+canvas.addEventListener('pointerdown', e => {
+  try { canvas.setPointerCapture(e.pointerId); } catch(_){}
+  stopMotion();
+  pts.set(e.pointerId, { x: sx(e), y: sy(e), x0: sx(e), y0: sy(e) });
+  if (pts.size === 1){
+    const mouse = e.pointerType === 'mouse', holds = !(mouse && (e.shiftKey || e.button === 2));
+    lifted = false; trail = []; twoTap = null;
+    // the second tap of a double tap, if it stays down and drags, zooms with one finger (up: nearer, down: farther)
+    const again = e.timeStamp - lastTap < 320 && lastTapPos && Math.hypot(sx(e) - lastTapPos.x, sy(e) - lastTapPos.y) < 40;
+    quick = again && !mouse ? { x: sx(e), y: sy(e), G: spot(sx(e), sy(e)), t: e.timeStamp, moved: false } : null;
+    tapStart = { x: sx(e), y: sy(e), t: e.timeStamp };
+    one = { holds, x0: sx(e), y0: sy(e), live: false, t: e.timeStamp, R0: R.map(v => v.slice()), pitch0: pitch };
+    grab = skyGrab = null; if (holds) grabAt(sx(e), sy(e));
+  } else if (pts.size === 2){
+    // the first finger of a two-finger touch lands a moment early: take back anything it did on its own
+    if (one && !one.late && e.timeStamp - one.t < 300){ R = one.R0; pitch = one.pitch0; }
+    one = null; tapStart = null; spin = null; lifted = false; trail = []; quick = null;
+    pair0 = prevPair = pair(); pending.clear(); grabAt(pair0.cx, pair0.cy);
+    for (const p of pts.values()){ p.x0 = p.x; p.y0 = p.y; }
+    twoTap = { t: e.timeStamp, cx: pair0.cx, cy: pair0.cy, R0: R.map(v => v.slice()), alt0: alt };   // two fingers tapped together: step out
+    mode2 = lowness() > 0 ? '?' : 'free';
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pts.get(e.pointerId); if (!p) return;
+  const x = sx(e), y = sy(e), dx = x - p.x, dy = y - p.y; p.x = x; p.y = y;
+  if (!dx && !dy) return;
+  const now = e.timeStamp;
+  if (pts.size === 1){
+    if (quick){
+      if (!quick.moved){ if (Math.abs(y - quick.y) < 8) return; quick.moved = true; }
+      setAlt(alt*Math.exp(-dy*Math.LN2/100));                              // 100 px doubles or halves the distance
+      if (quick.G && !pin(quick.G, quick.x, quick.y)) quick.G = null;
+      touch(); return;
+    }
+    if (!one) return;
+    if (one.late && !one.live){                          // the second of two fingers on its way off the glass does nothing -
+      // but if it stays and moves, it carries on as one finger
+      if (Math.hypot(x - one.x0, y - one.y0) < 14 || now - one.t < 150) return;
+      one.live = true; trail = []; grabAt(x - dx, y - dy);
+    }
+    if (one.holds && !e.shiftKey) drag(x, y, dx, dy, now);
+    else { tiltBy(-dy); swingBy(dx); trail = []; }       // (mouse with shift or the right button)
+  } else if (pts.size === 2){
+    // the two fingers report one after the other: act once both have (or one has twice), so half of a
+    // two-finger move is never mistaken for a pinch
+    if (twoTap && Math.hypot(x - p.x0, y - p.y0) > 10) twoTap = null;
+    if (pending.has(e.pointerId)) pairStep(now);
+    pending.add(e.pointerId);
+    if (pending.size === 2) pairStep(now);
+  } else return;
+  touch();
+});
+function up(e){
+  const had = pts.size;
+  if (had === 2 && pending.size) pairStep(e.timeStamp);
+  pts.delete(e.pointerId); pending.clear();
+  if (had === 2){
+    lifted = true; prevPair = pair0 = null; grab = skyGrab = null;
+    const p = [...pts.values()][0];
+    one = p ? { holds: true, late: true, x0: p.x, y0: p.y, live: false, t: e.timeStamp, R0: R, pitch0: pitch } : null;
+  }
+  if (had === 3 && pts.size === 2){ pair0 = prevPair = pair(); grabAt(pair0.cx, pair0.cy); twoTap = null; mode2 = 'free'; }   // third finger gone: carry on
+  if (pts.size === 0){
+    if (twoTap && e.timeStamp - twoTap.t < 320){                         // two-finger tap: one step farther, about the spot between
+      R = twoTap.R0; alt = twoTap.alt0; trail = [];
+      zoomStep(2, twoTap.cx, twoTap.cy);
+    } else if (quick){                                                   // the second tap came straight up again: a double tap
+      if (!quick.moved && e.timeStamp - quick.t < 350) doubleTap(sx(e), sy(e));
+      lastTap = 0; tapStart = null; trail = [];
+    } else if (one && one.late && !one.live && lifted) flick(e.timeStamp, 110);   // two fingers let go while moving: it carries on
+    else flick(e.timeStamp, 60);
+    twoTap = quick = null;
+    if (tapStart){
+      const now = e.timeStamp, x = sx(e), y = sy(e);
+      if (Math.hypot(x - tapStart.x, y - tapStart.y) < 10 && now - tapStart.t < 250){
+        spin = null;
+        if (now - lastTap < 320 && lastTapPos && Math.hypot(x - lastTapPos.x, y - lastTapPos.y) < 40){ doubleTap(x, y); lastTap = 0; }
+        else { lastTap = now; lastTapPos = { x, y }; }
+      }
+      tapStart = null;
+    }
+    lifted = false; one = null; grab = skyGrab = null;
+  }
+}
+canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+// Mouse wheel / trackpad: nearer or farther about the pointer. One notch of a wheel is about 1.4x, 200 px of
+// trackpad scrolling 2x, and a trackpad pinch follows the fingers; the motion is eased so that it is smooth.
+function wheelZoom(x, y, dLog){
+  spin = null; zoomAnim = glide = null; if (flight) endFlight();
+  if (!wheel || Math.hypot(x - wheel.x, y - wheel.y) > 6) wheel = { x, y, G: spot(x, y), la: Math.log(alt) };
+  wheel.la = Math.min(Math.log(MAX_ALT), Math.max(Math.log(floorAlt()), wheel.la + dLog));
+  touch();
+}
+canvas.addEventListener('wheel', e => { e.preventDefault();
+  const d = Math.max(-240, Math.min(240, e.deltaY*(e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 300 : 1)));
+  wheelZoom(sx(e), sy(e), d*(e.ctrlKey ? 0.01 : 0.0035));                // (ctrl: a trackpad pinch, reported in small steps)
+}, {passive:false});
+let gScale = 1;                                           // Safari on a Mac reports a trackpad pinch this way
+document.addEventListener('gesturestart', e => { e.preventDefault(); gScale = 1; });
+document.addEventListener('gesturechange', e => { e.preventDefault();
+  if (pts.size || !(e.scale > 0)) return;                 // (on a touch screen the fingers are already handled above)
+  wheelZoom(sx(e), sy(e), -Math.log(e.scale/gScale)); gScale = e.scale; });
+window.addEventListener('resize', touch);
+
+/* ------------------------------------------------------------------ stars buffer */
+let starVAO = null, starCount = 0, planetBuf = null;
+function buildStars(buf){
+  const i16 = new Int16Array(buf), n = i16.length/4, f = new Float32Array((n + 6)*5);
+  for (let i = 0; i < n; i++){
+    const ra = (i16[i*4] + 32768)/65535*2*Math.PI, de = i16[i*4+1]/32767*Math.PI/2;
+    f.set([Math.cos(de)*Math.cos(ra), Math.cos(de)*Math.sin(ra), Math.sin(de), i16[i*4+2]/1000, i16[i*4+3]/1000], i*5);
+  }
+  starCount = n;
+  starVAO = gl.createVertexArray(); gl.bindVertexArray(starVAO);
+  planetBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, planetBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, f, gl.DYNAMIC_DRAW);
+  const A = n => gl.getAttribLocation(SP, n);
+  gl.enableVertexAttribArray(A('aDir')); gl.vertexAttribPointer(A('aDir'), 3, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(A('aMag')); gl.vertexAttribPointer(A('aMag'), 1, gl.FLOAT, false, 20, 12);
+  gl.enableVertexAttribArray(A('aBV'));  gl.vertexAttribPointer(A('aBV'),  1, gl.FLOAT, false, 20, 16);
+  gl.bindVertexArray(null);
+}
+
+/* ------------------------------------------------------------------ frame */
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+// How many pixels the scene is drawn with. A real view does not blur when you turn your head, so sharpness comes
+// first while the view is moving - but not at the price of a slide show, on a phone or in a big browser window:
+//   moving: starts at up to 1.4 million pixels and follows the frame rate. It looks for the sharpest picture that
+//           still moves at the display's full rate, but will not go below 0.9 million pixels for that; if full
+//           rate is not on offer there, it takes the sharpest picture that holds 30 frames a second instead.
+//           Under 20 frames a second it goes down as far as half a million pixels (a phone's screen at 60%
+//           sharpness), and under ~11 frames a second as far as 0.3 million.
+//   still:  full sharpness, unless one such picture takes the GPU longer than about a fifth of a second.
+const cssArea = () => Math.max(1, canvas.clientWidth*canvas.clientHeight);
+const scaleFor = px => Math.min(DPR, Math.sqrt(px/cssArea()));     // the scale at which the scene has this many pixels
+let scale = 0, stillScale = 0, stillCost = 0, stillAt = 0, slow = 0, pace = [], lastFrame = 0, lastDraw = 0, settled = false, lastLum = 0;
+let probeAt = 0, backoff = 1500, mode30 = false, flashWas = false;
+function paceControl(m, now){                           // m: the usual time between the last few moving frames, ms
+  const f60 = scaleFor(0.9e6), soft = scaleFor(0.5e6), hard = scaleFor(0.3e6);
+  const stepUp = () => { scale = Math.min(DPR, scale*1.07); probeAt = now + 700; };
+  const stepBack = floor => { scale = Math.max(Math.min(scale, floor), scale*0.88); probeAt = now + backoff; backoff = Math.min(20000, backoff*2); };
+  if (m > 55){                                          // under 20 frames a second: fewer pixels, at once
+    scale = Math.max(Math.min(scale, m > 95 ? hard : soft), scale*Math.max(0.7, Math.sqrt(40/m)));
+    probeAt = now + backoff; mode30 = scale <= f60;
+  } else if (m >= 40){                                  // 20-25 frames a second
+    if (scale > soft) stepBack(soft); mode30 = true;
+  } else if (m >= 22){                                  // about 30 frames a second
+    if (!mode30 && scale > f60) stepBack(f60);          // a little sharpness for full rate...
+    else { mode30 = true; if (now > probeAt) stepUp(); }   // ...unless full rate is not on offer: then sharpness at 30
+  } else {                                              // full rate
+    mode30 = false;
+    if (now > probeAt){ if (scale < DPR) stepUp(); backoff = Math.max(1500, backoff*0.7); }
+  }
+}
+let S = null, timeOffset = 0;
+const nowMs = () => Date.now() + timeOffset;
+
+// Light from a body (Sun or Moon) reaching the eye, as a list of glare sources at their APPARENT directions.
+// Earth's atmosphere acts as a lens: a ray passing the limb at tangent altitude h is bent by delta(h),
+// so a body behind the Earth can be seen through the limb, on the near side (alpha - delta = phi) and the
+// far side (delta - alpha = phi). Each image's brightness is scaled by the lens magnification
+// mu = (alpha/phi)(d alpha/d phi) and by the extinction of its chord through the air.
+function glareSources(dir, angR, E, v, single){
+  const out = [];
+  const cl = len(v.cam), toE = sc(v.cam, -1/cl);
+  const H1 = 8*KM, H2 = 1.2*KM, ATMh = 100*KM;
+  const bend = h => 2.93e-4*Math.sqrt(2*Math.PI*(1 + h)/H1)*Math.exp(-h/H1);
+  const alpha = h => Math.asin(Math.min(0.999999, (1 + h)/cl));
+  const app = h => alpha(h) - bend(h);
+  const BRj = [7.189, 13.762, 32.518], BOj = [0.650, 1.881, 0.085];
+  const trans = h => { const r = 1 + h, oz = 2*(Math.sqrt(Math.max((1+40*KM)**2 - r*r, 0)) - Math.sqrt(Math.max((1+10*KM)**2 - r*r, 0)));
+    return [0,1,2].map(c => Math.exp(-6.378137*(BRj[c]*H1*Math.exp(-h/H1)*2*Math.sqrt(1.5708*r/H1) + 4.4*H2*Math.exp(-h/H2)*2*Math.sqrt(1.5708*r/H2) + BOj[c]*0.5*oz))); };
+  const inFrame = d => { const z = -dot(d, v.vb); if (z <= 0) return false;
+    const x = dot(d, v.vr)/z/CSS_PIX, y = dot(d, v.vu)/z/CSS_PIX, m = angR/CSS_PIX + 2;
+    return Math.abs(x) <= canvas.clientWidth/2 + m && Math.abs(y) <= canvas.clientHeight/2 + m; };
+  const solve = target => { let lo = 0, hi = ATMh; for (let k = 0; k < 32; k++){ const m = (lo + hi)/2; if (app(m) < target) lo = m; else hi = m; } return (lo + hi)/2; };
+  // sample the disc: centre + 2 rings (19 points)
+  const a0 = norm(cross(dir, Math.abs(dir[1]) < 0.9 ? [0,1,0] : [1,0,0])), b0 = cross(dir, a0);
+  const pts = [[0,0]];
+  for (let i = 0; i < 6; i++) pts.push([0.5*Math.cos(i*Math.PI/3), 0.5*Math.sin(i*Math.PI/3)]);
+  for (let i = 0; i < 12; i++) pts.push([0.87*Math.cos(i*Math.PI/6 + 0.26), 0.87*Math.sin(i*Math.PI/6 + 0.26)]);
+  const w = E/pts.length;
+  const add2 = (d, c) => { if (inFrame(d)) out.push({d, c}); };
+  const om = sub(v.cam, S.moon), cm = dot(om, om) - RMOON_J*RMOON_J;
+  for (const [px, py] of pts){
+    const d = norm(add(dir, add(sc(a0, px*angR), sc(b0, py*angR))));
+    if (!single){ const bm = dot(om, d); if (bm < 0 && bm*bm - cm > 0) continue; }   // this part of the Sun is behind the Moon
+    const phi = angBetween(d, toE);
+    if (cl <= 1 + ATMh){                                   // inside the air: one-way bend, no lensing
+      if (phi >= Math.asin(1/cl) - bend(0)/2) add2(d, [w,w,w]);
+      continue;
+    }
+    if (phi >= alpha(ATMh)) { add2(d, [w,w,w]); continue; } // clear line of sight
+    let perp = sub(d, sc(toE, dot(d, toE)));
+    perp = len(perp) > 1e-9 ? norm(perp) : a0;
+    const phiE = Math.max(phi, angR*0.3);                     // finite source size caps the ring focus
+    const img = (h, side) => {
+      const al = alpha(h), dadh = 1/(cl*Math.cos(al)), dddh = -bend(h)/H1;
+      const mu = Math.min(al/phiE, 60)*Math.abs(dadh/(dadh - dddh));
+      const ad = norm(add(sc(toE, Math.cos(al)), sc(perp, side*Math.sin(al))));
+      add2(ad, sc(trans(h), w*mu));
+    };
+    if (phi >= app(0)) img(solve(phi), 1);                   // near-side image
+    if (-phi >= app(0)) img(solve(-phi), -1);                // far-side image (bent across the axis)
+  }
+  // Directly visible parts of the disc stay separate (each a point source spaced across the visible sliver,
+  // so the haze follows what is actually above the limb); refracted images merge into 16 azimuth bins.
+  // single=true (Moon) merges everything into one source.
+  const bins = new Map(); let nd = 0;
+  for (const s of out){
+    const off = sub(s.d, sc(toE, dot(s.d, toE)));
+    const refr = angBetween(s.d, toE) < alpha(ATMh) + 1e-6 && cl > 1 + ATMh;
+    const key = single ? 'm' : refr ? 'r' + Math.floor((Math.atan2(dot(off, b0), dot(off, a0)) + Math.PI)/(2*Math.PI)*16) : 'd' + (nd++);
+    const L = s.c[0] + s.c[1] + s.c[2];
+    const b = bins.get(key) || {d:[0,0,0], c:[0,0,0], L:0, key};
+    b.d = add(b.d, sc(s.d, L)); b.c = add(b.c, s.c); b.L += L; bins.set(key, b);
+  }
+  const nR = [...bins.keys()].filter(k => k[0] === 'r').length;     // many lit azimuths = a ring of light
+  const rR = nR > 4 ? Math.max(0.06*D2R, 0.6*2*Math.PI*alpha(0)/16) : 0.06*D2R;
+  return [...bins.values()].filter(b => b.L > 0).map(b => ({d: norm(b.d), c: b.c,
+    r: single ? angR : (b.key && b.key[0] === 'r') ? rR : angR*0.22}));
+}
+
+// veiling glare (CIE 2002) at a lum-pass pixel, same formula as the shader
+function glareAt(px, py, c){                            // c: the small picture being digested { v, glare, lw, lh, k }
+  if (!c.glare || !c.glare.length) return 0;
+  const v = c.v, x = (px + 0.5 - c.lw/2)*c.k, y = (py + 0.5 - c.lh/2)*c.k;
+  const d = norm(sub(add(sc(v.vr, x), sc(v.vu, y)), v.vb));
+  let L = 0;
+  for (const g of c.glare){
+    const cs = d[0]*g.d[0] + d[1]*g.d[1] + d[2]*g.d[2];
+    const t = Math.max(cs >= 1 ? 0 : Math.acos(Math.max(-1, cs)), g.r)/D2R;
+    L += (0.2126*g.c[0] + 0.7152*g.c[1] + 0.0722*g.c[2])*(10/(t*t*t) + 5.13/(t*t) + 0.0513/t + 0.00125);
+  }
+  return L;
+}
+function uniforms(v, w, h, pix, mode){
+  gl.useProgram(P); gl.bindVertexArray(quadVAO);
+  gl.uniform1i(U.uMode, mode);
+  gl.uniform2f(U.uRes, w, h); gl.uniform1f(U.uPix, pix);
+  gl.uniform3fv(U.uCam, v.cam); gl.uniform3fv(U.uVR, v.vr); gl.uniform3fv(U.uVU, v.vu); gl.uniform3fv(U.uVB, v.vb);
+  gl.uniform3fv(U.uSun, S.sun); gl.uniform1f(U.uEsun, S.Esun); gl.uniform1f(U.uSunRad, S.sunRad); gl.uniform1f(U.uDec, S.decS);
+  gl.uniform3fv(U.uMoon, S.moon); gl.uniform3fv(U.uMX, S.mx); gl.uniform3fv(U.uMY, S.my); gl.uniform3fv(U.uMZ, S.mz);
+  gl.uniform1f(U.uEmoon, S.Emoon); gl.uniform1f(U.uEearth, S.Eearth);
+  gl.uniformMatrix3fv(U.uW2G, false, glMat(S.W2G));
+  const gd = new Float32Array(160), gc = new Float32Array(120);
+  S.glare.forEach((g, i) => { gd.set([g.d[0], g.d[1], g.d[2], g.r], i*4); gc.set(g.c, i*3); });
+  gl.uniform4fv(U.uGd, gd); gl.uniform3fv(U.uGc, gc); gl.uniform1i(U.uGn, window.__noGlare ? 0 : S.glare.length);
+  const La = Math.pow(10, logLa);
+  const sig = Math.max(0.6*La, 5e-3);
+  gl.uniform1f(U.uSigma, sig); gl.uniform1f(U.uBlack, mode === 1 ? 0 : Math.min(black, 0.08*5.67*sig));
+  gl.uniform1f(U.uScot, Math.min(0.92, Math.max(0, (Math.log10(3) - logLa)/3)));
+  { const dt_ = new Date(nowMs()), mo = dt_.getUTCMonth(), dim = new Date(Date.UTC(dt_.getUTCFullYear(), mo + 1, 0)).getUTCDate();
+    const f = mo + (dt_.getUTCDate() - 1 + dt_.getUTCHours()/24)/dim - 0.5, m0 = Math.floor(f);
+    gl.uniform3f(U.uMonth, (m0 + 12) % 12, (m0 + 13) % 12, f - m0); }
+  const liveAge = liveTime ? (nowMs() - liveTime)/3600000 : 1e9;
+  gl.uniform1f(U.uLive, liveAge < 36 ? 1 : 0); gl.uniform1f(U.uLiveAge, Math.max(0, liveAge));
+  gl.uniform4fv(U.uFlow, S.wx.flow); gl.uniform3fv(U.uOff, S.wx.off); gl.uniform4fv(U.uStorm, S.wx.storms);
+  gl.uniform1f(U.uNoCloud, window.__noClouds ? 1 : NANTEST ? 2 : 0); gl.uniform1f(U.uQ, mode === 0 && quality ? 1 : 0);
+  gl.uniform1f(U.uMoonHi, moonHiNow()); gl.uniform1f(U.uKp, kp); gl.uniform3fv(U.uEcl, S.ecl);
+}
+
+// ---- lightning: where, when, how bright
+// Thunderstorms are placed where today's cloud map has its deepest cloud, weighted the way real lightning is: far
+// more over land than sea, mostly in the tropics (following the Sun through the year) and peaking in the late
+// afternoon and evening. Worldwide that comes to the real ~45 flashes a second. Which storm flashes when is chance.
+const MAXFL = 80, flashData = new Float32Array(MAXFL*3*5), smallMaps = {};
+let flashes = [], storms = null, nearStorms = [], nearAt = 0, lastTick = 0, flashVAO = null, flashBuf = null, lastScene = null;
+function keepSmall(name, img){                           // a 1-degree copy of a map, for the page's own use
+  try { const c = document.createElement('canvas'); c.width = 360; c.height = 180;
+    const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, 360, 180);
+    smallMaps[name] = x.getImageData(0, 0, 360, 180).data; storms = null; } catch(e){}
+}
+function buildStorms(){
+  const cl = smallMaps.tCloud, wa = smallMaps.tWater; if (!cl || !wa) return;
+  const doy = (nowMs() - Date.UTC(new Date(nowMs()).getUTCFullYear(), 0, 0))/864e5, belt = 15*Math.sin(2*Math.PI*(doy - 105)/365);
+  const list = []; let tot = 0;
+  for (let j = 0; j < 180; j++){
+    const lat = 89.5 - j, fl = Math.exp(-(((lat - belt)/24)**2)) + 0.03;
+    for (let i = 0; i < 360; i++){
+      const c = cl[(j*360 + i)*4]/255; if (c < 0.58) continue;
+      const deep = Math.min(1, (c - 0.55)/0.35), w = deep*deep*fl*(wa[(j*360 + i)*4] < 128 ? 1 : 0.12)*Math.cos(lat*D2R);
+      if (w < 1e-4) continue;
+      const lon = i - 179.5, la = lat*D2R, lo = lon*D2R;
+      list.push({ lat, lon, w, dir: [Math.cos(la)*Math.sin(lo), Math.sin(la), Math.cos(la)*Math.cos(lo)] }); tot += w;
+    }
+  }
+  for (const s of list) s.rate = 45*s.w/(0.5*tot);       // flashes a second at its best hour
+  storms = list; nearAt = 0;
+}
+const gauss = () => Math.sqrt(-2*Math.log(1 - Math.random()))*Math.cos(2*Math.PI*Math.random());
+function tickFlashes(now, L){                            // true while any flash is alight
+  const v = L.v, dt = Math.min(0.1, (now - lastTick)/1000); lastTick = now;
+  flashes = flashes.filter(f => now < f.end);
+  const dist = len(v.cam), pix = CSS_PIX/DPR;
+  // No flash is made where none could be seen: from too far for its size, or with eyes used to daylight.
+  const across = Math.max(10e3, Math.max(0.9*pix, 2e-4)*Math.max(dist - 1, 0)*6378137);
+  if (dt <= 0 || 2e9/(6.2832*across*across)/(Math.max(0.6*Math.pow(10, logLa), 5e-3)*5.67) < 0.02) return flashes.length > 0;
+  if (!storms){ buildStorms(); if (!storms) return false; }
+  const camDir = sc(v.cam, 1/dist);
+  if (now - nearAt > 500){                               // the storms on this side of the globe that are in the dark
+    nearAt = now; const hz = 1/dist - 0.03, hw = 0.5*L.W + 150, hh = 0.5*L.H + 150;    // (in the dark, this side of the globe, and on screen or nearly)
+    nearStorms = storms.filter(s => {
+      if (dot(s.dir, camDir) <= hz || dot(s.dir, S.sun) >= -0.03) return false;
+      const r = sub(s.dir, v.cam), z = -dot(r, v.vb);
+      return z > 0 && Math.abs(dot(r, v.vr)) < hw*pix*z && Math.abs(dot(r, v.vu)) < hh*pix*z;
+    });
+  }
+  const sunLon = Math.atan2(S.sun[0], S.sun[2])/D2R;
+  for (const s of nearStorms){
+    let hr = ((s.lon - sunLon)/15 + 12) % 24; if (hr < 0) hr += 24;
+    const late = Math.min(Math.abs(hr - 17), 24 - Math.abs(hr - 17));
+    if (Math.random() >= s.rate*(0.25 + 0.75*Math.exp(-((late/5)**2)))*dt || flashes.length >= MAXFL) continue;
+    // one flash: a few strokes in quick succession, each lighting a few neighbouring parts of the cloud by different amounts
+    const la = (s.lat + Math.random() - 0.5)*D2R, lo = (s.lon + Math.random() - 0.5)*D2R, rr = 1 + 9*KM;
+    const strokes = []; let t = now;
+    for (let k = 1 + Math.floor(Math.random()**2*5); k > 0; k--){ strokes.push([t, strokes.length ? 0.3 + 0.7*Math.random() : 1]); t += 40 + 90*Math.random(); }
+    const parts = [], I = Math.min(8e9, 4e8*Math.exp(gauss()));
+    for (let k = 1 + Math.floor(Math.random()*3); k > 0; k--){
+      const a = la + (parts.length ? 0.0012*gauss() : 0), o = lo + (parts.length ? 0.0012*gauss()/Math.cos(la) : 0);
+      parts.push({ pos: [rr*Math.cos(a)*Math.sin(o), rr*Math.sin(a), rr*Math.cos(a)*Math.cos(o)], sig: (5 + 9*Math.random())*KM,
+        w: strokes.map(() => Math.random() + 0.15) });
+    }
+    for (let k = 0; k < strokes.length; k++){ let sum = 0; for (const p of parts) sum += p.w[k]; for (const p of parts) p.w[k] /= sum; }
+    flashes.push({ I, strokes, parts, end: t + 160 });
+  }
+  return flashes.length > 0;
+}
+function drawFlashes(v, w, h, pix, now){
+  if (!flashes.length) return;
+  if (!flashVAO){
+    flashVAO = gl.createVertexArray(); gl.bindVertexArray(flashVAO);
+    const A = n => gl.getAttribLocation(LP, n);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer()); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(A('aCorner')); gl.vertexAttribPointer(A('aCorner'), 2, gl.FLOAT, false, 0, 0);
+    flashBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, flashBuf); gl.bufferData(gl.ARRAY_BUFFER, flashData.byteLength, gl.DYNAMIC_DRAW);
+    for (const [n, size, off] of [['aPos', 3, 0], ['aI', 1, 12], ['aSig', 1, 16]]){
+      gl.enableVertexAttribArray(A(n)); gl.vertexAttribPointer(A(n), size, gl.FLOAT, false, 20, off); gl.vertexAttribDivisor(A(n), 1);
+    }
+  }
+  let n = 0;
+  for (const f of flashes) for (const p of f.parts){
+    let a = 0;                                           // each stroke: on at once, gone in a blink (as the eye holds it)
+    for (let k = 0; k < f.strokes.length; k++){ const [t, amp] = f.strokes[k]; if (now >= t) a += amp*p.w[k]*Math.exp(-(now - t)/35); }
+    if (f.hold) a = p.w[0];                              // (a test flash that stays lit)
+    flashData.set([p.pos[0], p.pos[1], p.pos[2], f.I*a, p.sig], 5*n++);
+  }
+  gl.useProgram(LP); gl.bindVertexArray(flashVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER, flashBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, flashData.subarray(0, 5*n));
+  gl.uniform3fv(LU.uCam, v.cam); gl.uniform3fv(LU.uVR, v.vr); gl.uniform3fv(LU.uVU, v.vu); gl.uniform3fv(LU.uVB, v.vb);
+  gl.uniform1f(LU.uPix, pix); gl.uniform2f(LU.uRes, w, h);
+  gl.uniform1f(LU.uW, Math.max(0.6*Math.pow(10, logLa), 5e-3)*5.67);              // the eye's white level (as in the scene)
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_COLOR);              // (light adds, but never past white)
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+  gl.disable(gl.BLEND); gl.bindVertexArray(null);
+}
+function overlay(now){                                   // the last scene again, with the stars and flashes as they are now
+  const L = lastScene; if (!L) return;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, L.W, L.H);
+  gl.useProgram(CP); gl.bindVertexArray(quadVAO);
+  gl.uniform1i(CU.tScene, 6); gl.uniform2f(CU.uRes, L.W, L.H);
+  gl.uniform2f(CU.uSub, L.w/L.W, L.h/L.H); gl.uniform2f(CU.uMax, (L.w - 0.5)/L.W, (L.h - 0.5)/L.H); gl.uniform2f(CU.uTexel, 1/L.W, 1/L.H);
+  gl.uniform1f(CU.uBlur, L.blur);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  drawStars(L.v, L.W, L.H, CSS_PIX/DPR); drawFlashes(L.v, L.W, L.H, CSS_PIX/DPR, now);
+}
+function drawStars(v, w, h, pix){
+  if (!starVAO) return;
+  const f = new Float32Array(30);
+  S.planets.forEach((p, i) => f.set([p.dir[0], p.dir[1], p.dir[2], p.mag, p.bv], i*5));
+  gl.bindBuffer(gl.ARRAY_BUFFER, planetBuf); gl.bufferSubData(gl.ARRAY_BUFFER, starCount*20, f);
+  gl.useProgram(SP); gl.bindVertexArray(starVAO);
+  gl.uniformMatrix3fv(SU.uJ2W, false, glMat(S.J2Wr));
+  gl.uniform3fv(SU.uCam, v.cam); gl.uniform3fv(SU.uVR, v.vr); gl.uniform3fv(SU.uVU, v.vu); gl.uniform3fv(SU.uVB, v.vb);
+  gl.uniform1f(SU.uPix, pix); gl.uniform2f(SU.uRes, w, h);
+  gl.uniform1f(SU.uEth, eyeThreshold(Math.pow(10, logLa))); gl.uniform1f(SU.uPx, w/canvas.clientWidth);
+  gl.uniform3fv(SU.uMoon, S.moon);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.drawArrays(gl.POINTS, 0, starCount + 6);
+  gl.disable(gl.BLEND); gl.bindVertexArray(null);
+}
+
+const NANTEST = /[?&]nan=1/.test(location.search);
+let quality = true;
+// ---- eye adaptation: a small rendering of the same view, digested when its read-back arrives
+function lumSize(){
+  let lw = Math.max(8, Math.round(canvas.clientWidth/8)), lh = Math.max(8, Math.round(canvas.clientHeight/8));
+  const over = Math.sqrt(lw*lh/6000);                   // a big window needs no more samples than a phone screen has
+  if (over > 1){ lw = Math.max(8, Math.round(lw/over)); lh = Math.max(8, Math.round(lh/over)); }
+  return [lw, lh];
+}
+function lumRequest(v, now){
+  const [lw, lh] = lumSize(); ensureLum(lw, lh);
+  const k = CSS_PIX*canvas.clientWidth/lw;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lumFB); gl.viewport(0, 0, lw, lh);
+  uniforms(v, lw, lh, k, 1); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  lumCtx = { v, glare: S.glare, lw, lh, k };
+  let queued = false;
+  if (lumAsync){
+    try {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, lumPBO); gl.bufferData(gl.PIXEL_PACK_BUFFER, lw*lh*4, gl.STREAM_READ);   // (fresh storage each time)
+      gl.readPixels(0, 0, lw, lh, gl.RGBA, gl.UNSIGNED_BYTE, 0); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      lumSync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); gl.flush(); queued = !!lumSync;
+    } catch(e){ lumSync = null; }
+    if (!queued) lumAsync = false;
+  }
+  if (!queued){ gl.readPixels(0, 0, lw, lh, gl.RGBA, gl.UNSIGNED_BYTE, lumBuf); lumDigest(); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  lastLum = now;
+}
+function lumPoll(){                                     // has the read-back arrived?
+  if (!lumSync) return;
+  let r; try { r = gl.clientWaitSync(lumSync, 0, 0); } catch(e){ r = gl.WAIT_FAILED; }
+  if (r === gl.TIMEOUT_EXPIRED) return;
+  if (r !== gl.WAIT_FAILED && !lumCtx.ready){ lumCtx.ready = true; return; }   // read it one frame later, when the browser has it at hand
+  const { lw, lh } = lumCtx; let ok = r !== gl.WAIT_FAILED;
+  if (ok){
+    try { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, lumPBO); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, lumBuf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); }
+    catch(e){ ok = false; }
+  }
+  gl.deleteSync(lumSync); lumSync = null;
+  if (!ok || !lumChecked){                              // the first time, and after any failure: check against a plain read-back
+    const ref = new Uint8Array(lw*lh*4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lumFB); gl.readPixels(0, 0, lw, lh, gl.RGBA, gl.UNSIGNED_BYTE, ref); gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    for (let i = 0; ok && i < ref.length; i += 97) ok = ref[i] === lumBuf[i];
+    if (!ok){ lumAsync = false; lumBuf.set(ref); }
+    lumChecked = true;
+  }
+  lumDigest();
+}
+function lumDigest(){
+  const c = lumCtx, lw = c.lw, lh = c.lh;
+  // The eye adapts to what it is looking at: the mean luminance of the lit parts of the view (black space ignored);
+  // if almost nothing is lit, it dark-adapts to the overall mean.
+  // Lightness constancy: when lit surfaces fill enough of the view, the eye judges them against the light
+  // falling on them (white stays white, ocean stays dark). Bright non-surface light (the Sun, glare,
+  // a backlit atmosphere) can still push adaptation up.
+  let sum = 0, sumLit = 0, cnt = 0, sumW = 0, sumW2 = 0, cntW = 0, sumNS = 0, cntNS = 0; const surfY = [];
+  const N = lw*lh;
+  for (let i = 0; i < N; i++){
+    const Y0 = Math.pow(2, (lumBuf[i*4]*256 + lumBuf[i*4+1])/65535*60 - 30);   // scene without eye glare
+    const wv = lumBuf[i*4+2]*256 + lumBuf[i*4+3];
+    const Y = Y0 + glareAt(i % lw, Math.floor(i/lw), c);                      // + veiling glare (CIE)
+    sum += Y; if (Y > 1e-3){ sumLit += Y; cnt++; }
+    if (wv > 0){ const lwv = Math.pow(2, wv/65535*60 - 30); sumW += lwv; sumW2 += lwv*lwv; cntW++; surfY.push(Y0); } else { sumNS += Y; cntNS++; }
+  }
+  let La;
+  // A lit body the eye can look straight at - anything about half a degree across or more, like the Earth from the
+  // Moon - sets the eye's level, however little of the view it fills. (Before, one filling under 3% of the view left the
+  // eye adapted to the black around it, and the far Earth came out bleached.) Smaller than that, it does so only in part.
+  const cellDeg2 = (canvas.clientWidth/lw)*(canvas.clientHeight/lh)*CSS_PIX*CSS_PIX*3282.8;
+  const tS = Math.min(1, Math.max(0, (cntW*cellDeg2 - 0.03)/0.47)), body = cntW > 0.03*N ? 1 : tS*tS*(3 - 2*tS);
+  // Constancy is only partial in dim light: sigma = 0.18 x white luminance in daylight, but follows
+  // (Lw/Lday)^0.8 below it, so a moonlit Earth looks dim and grey rather than like day.
+  // white reference of the LIT part of the view (light-weighted), so a thin sunlit crescent isn't averaged with the night
+  const LaField = Math.max(1e-5, cnt > 0.03*N ? sumLit/cnt : sum/N);
+  if (body > 0 && sumW > 0){ const Lw = sumW2/sumW, LD = 30000;
+    const LaBody = Math.max(0.25*LD*Math.pow(Math.min(Lw, LD)/LD, 0.8)*Math.max(1, Lw/LD), body >= 1 && cntNS ? sumNS/cntNS : 0);
+    La = Math.exp(Math.log(LaField)*(1 - body) + Math.log(Math.max(LaBody, LaField))*body); }
+  else La = LaField;
+  targetLogLa = Math.log10(Math.min(3e6, Math.max(1e-5, La)));   // cones adapt (bleach) up to ~1e6-1e7 cd/m²
+  // Contrast constancy: the eye discounts an even veil (the air's blue haze over the whole disc), much as
+  // calibrated imagery sets the darkest real surface as black. Black point = 55% of the 5th-percentile
+  // surface luminance, capped so a uniform cloud deck isn't over-stretched.
+  if (surfY.length > 0.03*N || (body >= 1 && surfY.length >= 8)){ surfY.sort((a, b) => a - b); blackTarget = 0.55*surfY[Math.floor(surfY.length*0.05)]; }
+  else blackTarget = 0;
+  if (blackTarget > 0 && cntW && blackTarget < 1e-4*sumW2/sumW) blackTarget = 0;
+}
+function draw(s, now, still){
+  quality = still !== false;
+  S = astro(nowMs()); S.wx = weather(nowMs());
+  const v = view();
+  S.glare = glareSources(S.sun, S.sunRad, S.Esun, v);
+  const mrel = sub(S.moon, v.cam), md = len(mrel), mAng = Math.asin(Math.min(1, RMOON_J/md));
+  if (!moonHiState && (focus === 'moon' || mAng > 1.5*D2R || (flight && flight.cross && flight.body === 'moon'))) wantMoonHi();
+  if (moonHiState === 2 && moonHiNow() < 1) touch();                // (its relief fades in)
+  if (mAng < 2*D2R)                 // from close by the Moon is a landscape, not a point of glare
+    S.glare = S.glare.concat(glareSources(sc(mrel, 1/md), mAng, S.Emoon*(len(S.moon)/md)**2, v, true)).slice(0, 40);
+
+  // 1) eye adaptation: average luminance of a small rendering of the same view
+  if (!lumSync && now - lastLum > (still === false ? 200 : 120)) lumRequest(v, now);
+  const dt = Math.min(2.5, (now - (draw.prev || now))/1000); draw.prev = now;   // (still pictures may be seconds apart: the eye keeps real time)
+  // Light adaptation is fast. Dark adaptation has two stages (Hecht's curve): a fast neural stage, then slow
+  // pigment regeneration. After daylight: ~3 log units at once, then ~4 s per log unit (time-compressed from
+  // minutes) so the night side appears within seconds. After the Sun (heavy bleaching): only ~1.5 log units
+  // at once and ~20 s per log unit, so its afterglow keeps you dazzled and a setting Sun's glow stays small.
+  if (!freezeLa){
+    if (targetLogLa > logLa){ logLa += (targetLogLa - logLa)*(1 - Math.exp(-dt/0.35)); }
+    else {
+      const sunBleached = bleach > 4.5;                       // above ~3e4 cd/m²: Sun-level bleaching
+      logLa += (Math.max(targetLogLa, bleach - (sunBleached ? 1.5 : 3.0)) - logLa)*(1 - Math.exp(-dt/0.7));
+    }
+    bleach = Math.max(logLa, bleach - dt/(bleach > 4.5 ? 20 : 4));
+  }
+  black += (blackTarget - black)*(1 - Math.exp(-dt/0.5));
+
+  // 2) the view. The canvas keeps its full size (resizing it is slow); while the view is moving the scene is
+  //    drawn into a corner of its texture and enlarged to the canvas by the last pass.
+  const W = Math.max(1, Math.round(canvas.clientWidth*DPR)), H = Math.max(1, Math.round(canvas.clientHeight*DPR));
+  if (canvas.width !== W || canvas.height !== H){ canvas.width = W; canvas.height = H; }
+  ensureScene(W, H);
+  const w = Math.max(1, Math.min(W, Math.round(canvas.clientWidth*s))), h = Math.max(1, Math.min(H, Math.round(canvas.clientHeight*s)));
+  const pix = CSS_PIX*canvas.clientWidth/w;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFB); gl.viewport(0, 0, w, h);
+  uniforms(v, w, h, pix, 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H);
+  // minimum angle of resolution vs adaptation luminance (fit to Shlaer 1937): 1' at 10 cd/m², ~10' at 1e-3
+  const lL = logLa + Math.log10(0.6);
+  const logMAR = Math.max(-0.1, 0.11 + (lL < 0 ? -0.28*lL : -0.11*lL));
+  const extra = Math.sqrt(Math.max(0, Math.pow(10, 2*logMAR) - 1));          // arcmin beyond normal acuity
+  gl.useProgram(CP); gl.bindVertexArray(quadVAO);
+  gl.uniform1i(CU.tScene, 6); gl.uniform2f(CU.uRes, W, H);
+  gl.uniform2f(CU.uSub, w/W, h/H); gl.uniform2f(CU.uMax, (w - 0.5)/W, (h - 0.5)/H); gl.uniform2f(CU.uTexel, 1/W, 1/H);
+  const blur = 1.5*extra/(pix*3437.75);
+  if (blur >= 1.82){ gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.generateMipmap(gl.TEXTURE_2D); }   // (1.82: where the blur starts reading the smaller copies)
+  gl.uniform1f(CU.uBlur, blur);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  drawStars(v, W, H, CSS_PIX/DPR);                                           // (the stars are always drawn at full sharpness)
+  drawFlashes(v, W, H, CSS_PIX/DPR, now);
+  lastScene = { W, H, w, h, blur, v };
+  lastDraw = now;
+}
+
+function frame(now){
+  lumPoll();
+  if (flight) stepFlight(now);
+  stepZoom(now);
+  if (!pts.size && spin){                                             // a flick keeps the globe turning, slowing down
+    const dtf = Math.min(100, lastFrame ? now - lastFrame : 16);
+    if (spin.w*16 > 0.03*CSS_PIX*Math.min(1, alt/bodyRad())){ rotateCam(spin.axis, spin.w*dtf); spin.w *= Math.pow(0.93, dtf/16); touch(); }
+    else spin = null;
+  }
+  const adapting = Math.abs(targetLogLa - logLa) > 0.01;
+  if (stillAt){                                                       // how long did the last still picture take the GPU?
+    stillCost = now - stillAt; stillAt = 0;
+    if (stillCost > 220) stillScale = Math.max(Math.min(stillScale, Math.max(scale, scaleFor(1.0e6))), stillScale*0.8);   // too heavy: ease off
+    else if (stillCost < 70) stillScale = Math.min(DPR, stillScale*1.12);
+  }
+  if (dirty){
+    const hard = scaleFor(0.3e6);
+    scale = scale ? Math.min(scale, DPR) : scaleFor(1.4e6);
+    draw(scale, now, false);
+    const ft = now - lastFrame;
+    if (lastFrame && ft < 1500){                                      // (a longer gap is the app coming back, not a slow frame)
+      pace.push(ft);
+      slow = ft > 150 ? slow + 1 : 0;
+      if (slow >= 2){ scale = Math.max(Math.min(scale, hard), scale*0.6); pace = []; slow = 0; }   // a slide show: cut at once
+    } else { pace = []; slow = 0; }
+    if (pace.length >= 5){ const m = pace.sort((a, b) => a - b)[1]; pace = []; paceControl(m, now); }   // (hitches ignored)
+    dirty = false; settled = false;
+  } else if (!settled && now - lastInteract > 400){
+    if (!stillScale) stillScale = scaleFor(4e6);                      // (a very large window works up to full sharpness)
+    draw(stillScale, now); settled = true; stillAt = now;             // the still picture
+  } else if (now - lastDraw > Math.max(adapting ? 66 : 2000, settled ? 4*stillCost : 0)){
+    draw(settled ? stillScale || DPR : scale || DPR, now, settled);   // keep time and eyes current (without hogging the GPU)
+    if (settled) stillAt = now;
+  }
+  if (lastScene && S && (tickFlashes(now, lastScene) || flashWas) && lastDraw !== now) overlay(now);   // lightning flickers on its own clock
+  flashWas = flashes.length > 0;
+  lastFrame = now;
+  requestAnimationFrame(frame);
+}
+
+const K = big ? '8k' : '4k';
+Promise.all([
+  loadTex(0, `tex/day${K}.jpg`, 'tDay', false),
+  loadTex(1, `tex/lights${K}.jpg`, 'tLights', true),
+  loadTex(2, 'tex/dem8k.png', 'tTopo', true, big ? 0 : 4096),
+  loadTex(11, 'tex/rug.png', 'tRug', true),
+  loadTex(3, 'tex/water.png', 'tWater', true),
+  loadTex(4, 'tex/moon.jpg', 'tMoon', true),
+  loadTex(5, 'tex/milkyway.png', 'tMW', true),
+  loadTex(8, 'tex/clouds.jpg', 'tCloud', true),
+  loadTex(9, 'tex/seasons.jpg', 'tSeason', false),
+  fetch('tex/stars.txt').then(r => r.text()).then(t => { const s = atob(t.trim()), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); buildStars(u.buffer); }),
+]).then(() => requestAnimationFrame(frame));
+
+/* ------------------------------------------------------------------ the Moon up close */
+// The Moon's relief (NASA LOLA elevation) and a sharper colour map (NASA LROC) are only fetched when the Moon is
+// approached: from the Earth it is half a degree across and they would show nothing.
+for (const [unit, name] of [[12, 'tMoonH'], [13, 'tMoonB']]){                 // (stand-ins until then)
+  const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([128]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.useProgram(P); gl.uniform1i(U[name], unit);
+}
+// How active the aurora is right now: the planetary K index (0 calm .. 9 great storm) from NOAA's Space Weather
+// Prediction Center, when the page is online and allowed to ask. Otherwise an ordinary quiet night (2).
+let kp = 2;
+const KP_URL = 'https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json';
+function readKp(j){                                      // the newest reading, whichever of NOAA's layouts it comes in
+  if (!Array.isArray(j) || !j.length) return null;
+  const last = j[j.length - 1], head = j[0];
+  let v = null;
+  if (Array.isArray(last)){ const i = Array.isArray(head) ? head.findIndex(h => /^kp/i.test(String(h))) : -1; v = last[i < 0 ? 1 : i]; }
+  else if (last && typeof last === 'object'){ const k = Object.keys(last).find(k => /^kp(_index)?$/i.test(k)) || Object.keys(last).find(k => /^(estimated_)?kp/i.test(k)); v = k ? last[k] : null; }
+  v = parseFloat(v);
+  return v >= 0 && v <= 9 ? v : null;
+}
+async function loadKp(){
+  try {
+    if (S && Math.abs(nowMs() - Date.now()) > 6*3600e3) return;       // (only for the real present)
+    const r = await fetch(KP_URL, {mode: 'cors', cache: 'no-cache'}); if (!r.ok) return;
+    const v = readKp(await r.json());
+    if (v !== null && Math.abs(v - kp) > 0.01){ kp = v; touch(); }
+  } catch(e){}
+}
+setTimeout(loadKp, 3000); setInterval(loadKp, 30*60e3);
+let moonHiState = 0, moonHiT0 = 0;                                            // 0: not asked for, 1: loading, 2: in use
+function wantMoonHi(){
+  if (moonHiState) return; moonHiState = 1;
+  Promise.all([loadTex(12, 'tex/moonh.png', 'tMoonH', true), loadTex(13, 'tex/moonb.png', 'tMoonB', true)])
+    .then(() => loadTex(4, 'tex/moon4k.jpg', 'tMoon', false))
+    .then(() => { moonHiState = 2; moonHiT0 = performance.now(); touch(); })
+    .catch(() => { moonHiState = 0; });                                       // (offline and not stored: the plain Moon stays)
+}
+const moonHiNow = () => moonHiState === 2 ? Math.min(1, (performance.now() - moonHiT0)/600) : 0;
+
+/* ------------------------------------------------------------------ live clouds (when hosted online) */
+// Latest global cloud map, rebuilt every 3 h from EUMETSAT geostationary imagery (matteason/live-cloud-maps, CORS-enabled).
+// Kept in the browser cache for offline use; ignored if older than 36 h. A page hosted inside Claude is not allowed
+// to fetch outside data, so there it silently falls back to the stored map; on its own address it is live.
+const LIVE_URL = 'https://clouds.matteason.co.uk/images/4096x2048/clouds.jpg';
+let liveTime = 0, liveTex = null;
+const credit = document.createElement('div');
+credit.textContent = 'Contains modified EUMETSAT data';
+credit.style.cssText = 'position:fixed;left:0;right:0;bottom:calc(10px + env(safe-area-inset-bottom));text-align:center;font:11px -apple-system,system-ui,sans-serif;color:rgba(255,255,255,0.55);pointer-events:none;opacity:0;transition:opacity 1.5s';
+document.body.appendChild(credit);
+function showCredit(){ credit.style.opacity = '1'; setTimeout(() => credit.style.opacity = '0', 4000); }
+// The live picture is not a map of cloud. It is a heat picture taken by weather satellites (cold = white), brightened
+// to look good as an overlay, so everything cold shows white: cloud tops, but also a desert at dawn, winter land,
+// polar seas. And it has nothing real poleward of 67 degrees (the satellites sit over the equator; the makers fill the
+// caps with a mirror image and white). So before it is used:
+//  1. the brightening is undone, back to how cold each spot looked;
+//  2. for every region the coldness of its clear ground is found - the warmest readings around, land and sea apart,
+//     land allowed for its height - and taken off, so only what is colder than the ground under it counts as cloud;
+//  3. where the ground itself reads as cold as the picture can show - it is maxed out at about freezing, which in
+//     winter is most land poleward of 40 degrees, and the polar seas - cloud cannot be told from ground at all, and
+//     there, as toward the poles, the stored map takes over.
+// What is left out: low cloud about as warm as the sea under it, which a heat picture cannot tell from the sea.
+function liveToCloud(v, W, H, stored, water, elev, w2, h2){
+  const out = new Uint8Array(W*H), sh = Math.round(Math.log2(W/w2));
+  const cold = new Float32Array(256);                    // (their recipe: stretch, gamma 1.46, x0.77, gamma 2)
+  for (let b = 0; b < 256; b++) cold[b] = Math.pow(Math.min(1, (b/255)**2/0.77), 1.46);
+  const LK = 0.13*6.4/255;                               // colder by this much per step of the height map (per 25 m)
+  const B = 8, bw = W/B, bh = H/B, nb = bw*bh;
+  const lowL = new Float32Array(nb*3).fill(9), lowS = new Float32Array(nb*3).fill(9);
+  for (let y = 0; y < H; y++){
+    const r2 = (y >> sh)*w2, rb = (y >> 3)*bw;
+    for (let x = 0; x < W; x++){
+      const j = r2 + (x >> sh), sea = water[j] > 127, k = cold[v[y*W + x]] - (sea ? 0 : elev[j]*LK);
+      const a = sea ? lowS : lowL, b = (rb + (x >> 3))*3;                       // keep the three warmest of the block
+      if (k < a[b + 2]){ if (k < a[b + 1]){ a[b + 2] = a[b + 1]; if (k < a[b]){ a[b + 1] = a[b]; a[b] = k; } else a[b + 1] = k; } else a[b + 2] = k; }
+    }
+  }
+  // ...then the usual coldness of each block's clear ground: the mean of its readings near that warm end
+  const sumL = new Float32Array(nb), cntL = new Float32Array(nb), sumS = new Float32Array(nb), cntS = new Float32Array(nb);
+  for (let y = 0; y < H; y++){
+    const r2 = (y >> sh)*w2, rb = (y >> 3)*bw;
+    for (let x = 0; x < W; x++){
+      const j = r2 + (x >> sh), sea = water[j] > 127, k = cold[v[y*W + x]] - (sea ? 0 : elev[j]*LK), b = rb + (x >> 3);
+      if (sea){ if (k <= lowS[b*3 + 2] + 0.10){ sumS[b] += k; cntS[b]++; } } else if (k <= lowL[b*3 + 2] + 0.10){ sumL[b] += k; cntL[b]++; }
+    }
+  }
+  // Clear-ground coldness everywhere: blocks whose warm end is close to the warmest within R blocks are taken as showing
+  // ground, and their values are spread smoothly over the rest (under cloud, the ground is read from its surroundings).
+  const ground = (low, sum, cnt, R) => {
+    const a = new Float32Array(nb), t = new Float32Array(nb), g0 = new Float32Array(nb);
+    for (let i = 0; i < nb; i++) a[i] = low[i*3 + 2] < 9 ? low[i*3 + 2] : low[i*3 + 1] < 9 ? low[i*3 + 1] : low[i*3];
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++){ let m = 9; for (let d = -R; d <= R; d++){ const q = a[y*bw + ((x + d + bw) % bw)]; if (q < m) m = q; } t[y*bw + x] = m; }
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++){ let m = 9; for (let d = -R; d <= R; d++){ const yy = y + d; if (yy < 0 || yy >= bh) continue; const q = t[yy*bw + x]; if (q < m) m = q; } g0[y*bw + x] = m; }
+    let val = new Float32Array(nb), wgt = new Float32Array(nb);
+    for (let i = 0; i < nb; i++) if (a[i] < 9 && a[i] <= g0[i] + 0.15){ val[i] = cnt[i] ? sum[i]/cnt[i] : a[i]; wgt[i] = 1; }
+    for (let pass = 0; pass < 2; pass++){                // (two box blurs of radius 3, weights carried along)
+      const v2_ = new Float32Array(nb), w2_ = new Float32Array(nb);
+      for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++){ let sv = 0, sw = 0;
+        for (let dy = -3; dy <= 3; dy++){ const yy = y + dy; if (yy < 0 || yy >= bh) continue; for (let dx = -3; dx <= 3; dx++){ const q = yy*bw + ((x + dx + bw) % bw); sv += val[q]*wgt[q]; sw += wgt[q]; } }
+        v2_[y*bw + x] = sw > 0 ? sv/sw : 0; w2_[y*bw + x] = sw > 0 ? Math.min(1, sw/6) : 0; }
+      val = v2_; wgt = w2_;
+    }
+    for (let i = 0; i < nb; i++) t[i] = wgt[i] > 0 ? val[i]*wgt[i] + (g0[i] < 9 ? g0[i] + 0.06 : val[i])*(1 - wgt[i]) : g0[i] < 9 ? g0[i] + 0.06 : 9;
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++){ let sv = 0, sw = 0;      // (smoothed once more: no block edges)
+      for (let dy = -2; dy <= 2; dy++){ const yy = y + dy; if (yy < 0 || yy >= bh) continue; for (let dx = -2; dx <= 2; dx++){ const q = t[yy*bw + ((x + dx + bw) % bw)]; if (q < 9){ sv += q; sw++; } } }
+      a[y*bw + x] = sw ? sv/sw : 9; }
+    return a;
+  };
+  const gL = ground(lowL, sumL, cntL, 6), gS = ground(lowS, sumS, cntS, 9);
+  for (let i = 0; i < nb; i++){ if (gL[i] >= 9) gL[i] = gS[i] < 9 ? gS[i] : 0; if (gS[i] >= 9) gS[i] = gL[i]; }
+  // Open sea is never colder than a known amount for its latitude (measured on the picture itself: it reads 0 at
+  // 19 C or warmer, 1 at -7 C). So a storm wider than the search above cannot pass for cold sea.
+  for (let y = 0; y < bh; y++){
+    const la = 90 - (y + 0.5)/bh*180, sst = Math.max(271.4, 301 - 0.009*(la - 4)*(la - 4)), cap = Math.min(0.85, Math.max(0, (292 - sst)/26)) + 0.22;
+    for (let x = 0; x < bw; x++) if (gS[y*bw + x] > cap) gS[y*bw + x] = cap;
+  }
+  // lakes and narrow seas take after the land around them: how much of each neighbourhood is water
+  let wf = new Float32Array(nb);
+  { const f = w2/bw; for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) wf[y*bw + x] = water[Math.floor((y + 0.5)*f)*w2 + Math.floor((x + 0.5)*f)] > 127 ? 1 : 0;
+    for (let pass = 0; pass < 2; pass++){ const o = new Float32Array(nb);
+      for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++){ let sv = 0, n = 0;
+        for (let dy = -3; dy <= 3; dy++){ const yy = y + dy; if (yy < 0 || yy >= bh) continue; for (let dx = -3; dx <= 3; dx++){ sv += wf[yy*bw + ((x + dx + bw) % bw)]; n++; } }
+        o[y*bw + x] = sv/n; }
+      wf = o; } }
+  const coast = new Uint8Array(w2*h2);                   // near a shore the picture and the map may not line up: take the colder ground
+  for (let y = 0; y < h2; y++) for (let x = 0; x < w2; x++){ let lo = 255, hi = 0;
+    for (let dy = -1; dy <= 1; dy++){ const yy = Math.min(h2 - 1, Math.max(0, y + dy)); for (let dx = -1; dx <= 1; dx++){ const q = water[yy*w2 + ((x + dx + w2) % w2)]; if (q < lo) lo = q; if (q > hi) hi = q; } }
+    coast[y*w2 + x] = lo < 128 && hi > 127 ? 1 : 0; }
+  const ss = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a)/(b - a))); return t*t*(3 - 2*t); };
+  for (let y = 0; y < H; y++){
+    const lat = Math.abs(90 - (y + 0.5)/H*180), pole = ss(60, 67, lat), r2 = (y >> sh)*w2;
+    const fy = Math.min(bh - 1, Math.max(0, (y + 0.5)/B - 0.5)), y0 = Math.floor(fy), y1 = Math.min(bh - 1, y0 + 1), ty = fy - y0;
+    for (let x = 0; x < W; x++){
+      const i = y*W + x;
+      if (pole >= 1){ out[i] = stored[i]; continue; }
+      const fx = (x + 0.5)/B - 0.5 + bw, x0 = Math.floor(fx), tx = fx - x0, xa = x0 % bw, xb = (x0 + 1) % bw;
+      const lerp = g => (g[y0*bw + xa]*(1 - tx) + g[y0*bw + xb]*tx)*(1 - ty) + (g[y1*bw + xa]*(1 - tx) + g[y1*bw + xb]*tx)*ty;
+      const j = r2 + (x >> sh), sea = water[j] > 127, gl_ = lerp(gL) + elev[j]*LK, gs_ = lerp(gS);
+      const open = sea && !coast[j] && wf[Math.min(bh - 1, y >> 3)*bw + (x >> 3)] > 0.6;       // open sea, away from any shore
+      const gnd = open ? gs_ : sea || coast[j] ? Math.max(gl_, gs_) : gl_, mar = open ? 0.04 : 0.08;
+      // how far above its ground a spot reads, as a share of the room the picture has left above that ground
+      const e = Math.min(1, (cold[v[i]] - gnd - mar)/Math.max(0.25, 1 - gnd - mar));
+      const c = e > 0 ? 0.9*(1 - Math.exp(-2.0*e))/(1 - Math.exp(-2.0)) : 0;
+      const live = c > 0 ? 255*(0.06 + 0.94*c) : 0;      // (the scale the stored map is on: see cfrac)
+      const blind = Math.max(pole, ss(0.72, 0.88, gnd)); // no room left above the ground: the picture cannot say
+      out[i] = Math.round(live + (stored[i] - live)*blind);
+    }
+  }
+  return out;
+}
+// (done off to the side, so the picture on screen does not freeze while it is worked out)
+function liveToCloudAside(a){
+  return new Promise(res => {
+    const here = () => res(liveToCloud(a.v, a.W, a.H, a.stored, a.water, a.elev, a.w2, a.h2));
+    try {
+      const src = liveToCloud.toString() + ';onmessage=e=>{const d=e.data,o=liveToCloud(d.v,d.W,d.H,d.stored,d.water,d.elev,d.w2,d.h2);postMessage(o,[o.buffer]);};';
+      const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), w = new Worker(url);
+      w.onmessage = e => { w.terminate(); URL.revokeObjectURL(url); res(e.data); };
+      w.onerror = () => { w.terminate(); URL.revokeObjectURL(url); here(); };
+      w.postMessage(a);
+    } catch(e){ here(); }
+  });
+}
+const pause = () => new Promise(r => setTimeout(r, 30));
+const rawImgs = {};
+function grayOf(src, w, h){                              // a picture's brightness as plain numbers
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(src, 0, 0, w, h);
+  const d = x.getImageData(0, 0, w, h).data, o = new Uint8Array(w*h);
+  for (let i = 0; i < o.length; i++) o[i] = d[i*4];
+  c.width = c.height = 0; return o;
+}
+async function loadLive(){
+  try {
+    let cache = null; try { cache = await caches.open('earth-live'); } catch(e){}
+    let resp = cache ? await cache.match(LIVE_URL) : null;
+    let t = resp ? Date.parse(resp.headers.get('last-modified') || '') || 0 : 0;
+    if (!resp || Date.now() - t > 3*3600e3){
+      try {
+        const r = await fetch(LIVE_URL, {mode: 'cors', cache: 'no-cache'});
+        if (r.ok){ if (cache) await cache.put(LIVE_URL, r.clone()); resp = r; t = Date.parse(r.headers.get('last-modified') || '') || Date.now(); }
+      } catch(e){}
+    }
+    if (!resp || t === liveTime) return;
+    if (!(rawImgs.tCloud && rawImgs.tWater && rawImgs.tTopo)){ setTimeout(loadLive, 3000); return; }   // (the stored maps are needed to read it)
+    const bmp = await createImageBitmap(await resp.blob());
+    const LW = lowMem ? 2048 : 4096, LH = LW/2;
+    const a = { W: LW, H: LH, w2: 2048, h2: 1024 };
+    a.v = grayOf(bmp, LW, LH); await pause(); a.stored = grayOf(rawImgs.tCloud, LW, LH); await pause();
+    a.water = grayOf(rawImgs.tWater, 2048, 1024); await pause(); a.elev = grayOf(rawImgs.tTopo, 2048, 1024); await pause();
+    const cloud = await liveToCloudAside(a);
+    const tx = gl.createTexture(); gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, tx);
+    if (liveTex) gl.deleteTexture(liveTex);               // (the map it replaces)
+    liveTex = tx;
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, LW, LH, 0, gl.RED, gl.UNSIGNED_BYTE, cloud);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.useProgram(P); gl.uniform1i(U.tLive, 10);
+    if (!liveTime) showCredit();
+    { const sm = new Uint8ClampedArray(360*180*4), f = LW/360;                  // a 1-degree copy, for placing thunderstorms
+      for (let j = 0; j < 180; j++) for (let i = 0; i < 360; i++) sm[(j*360 + i)*4] = cloud[Math.floor((j + 0.5)*f)*LW + Math.floor((i + 0.5)*f)];
+      smallMaps.tCloud = sm; storms = null; }
+    liveTime = t; touch();
+  } catch(e){}
+}
+setTimeout(loadLive, 1500); setInterval(loadLive, 30*60e3);
+{ // a placeholder so the sampler is always valid
+  const tx = gl.createTexture(); gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, tx);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+  gl.useProgram(P); gl.uniform1i(U.tLive, 10);
+}
+
+if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.js').catch(()=>{}); } catch(e){} }
+window.__astroTest = ms => { const a = astro(ms); const ll = v => { const l = len(v); return [Math.atan2(v[0], v[2])/D2R, Math.asin(v[1]/l)/D2R, l]; }; const J = a.J2Wr; return { sun: ll(a.sun), moon: ll(a.moon), pl: a.planets.map(p => [p.mag.toFixed(2), (Math.atan2(p.dir[1],p.dir[0])/D2R+360)%360, Math.asin(p.dir[2])/D2R]) }; };
+window.__earth = { get alt(){return alt;}, set alt(v){alt=v; touch();}, get pitch(){return pitch;}, set pitch(v){pitch=v; touch();}, get tiltNow(){ return tiltNow(); }, get pitchMax(){ return pitchMax(); },
+  twist(a){ rotateCam(R[2], a); touch(); }, zoom(f){ setAlt(alt*f); touch(); }, tilt(d){ tiltBy(d); touch(); },
+  faceDirOff(d, deg){ const b = norm(d); const ax = norm(cross(b,[0,1,0])); this.faceDir(rot(b, ax, deg*D2R)); },
+  faceDir(d){ R = northUp(norm(d)); touch(); },
+  get S(){return S;}, get La(){return Math.pow(10, logLa);}, setTime(ms){ timeOffset = ms - Date.now(); touch(); }, get sunNow(){ return S.sun; }, get target(){return Math.pow(10,targetLogLa);}, setLa(v){logLa=targetLogLa=bleach=Math.log10(v); freezeLa=true; touch();},
+  get focus(){return focus;}, get flying(){return !!flight;}, get black(){return black;}, get tiltMax(){return tiltMax();}, tap: doubleTap, home: goHome,
+  ll(x, y){ const G = spot(x, y); return G && [Math.asin(G[1])/D2R, Math.atan2(G[0], G[2])/D2R]; },
+  proj(d, isPoint){ const v = view(); const r = isPoint ? sub(d, v.cam) : d; const z = -dot(r, v.vb); return z > 0 ? [dot(r, v.vr)/z/CSS_PIX, dot(r, v.vu)/z/CSS_PIX] : null; },
+  dirAt(x, y){ const v = view(); return norm(sub(add(sc(v.vr, x*CSS_PIX), sc(v.vu, y*CSS_PIX)), v.vb)); },
+  bench2(n){ const px = new Uint8Array(4); const t0 = performance.now(); for (let i = 0; i < n; i++){ draw(1, performance.now(), false); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - t0)/n; },
+  bench(n){ const px = new Uint8Array(4); const t0 = performance.now(); for (let i = 0; i < n; i++){ draw(1, performance.now()); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - t0)/n; },
+  get scale(){ return scale; }, set scale(v){ scale = v; }, get flashes(){ return flashes.length; }, flashAt(lat, lon, I, ms, sig){ const la = lat*D2R, lo = lon*D2R, rr = 1 + 9*KM, t = performance.now(); flashes.push({ I: I || 4e8, strokes: [[t, 1]], hold: 1, end: t + (ms || 5000), parts: [{ pos: [rr*Math.cos(la)*Math.sin(lo), rr*Math.sin(la), rr*Math.cos(la)*Math.cos(lo)], sig: (sig || 12)*KM, w: [1] }] }); }, get kp(){ return kp; }, set kp(v){ kp = v; touch(); }, readKp, get flashDbg(){ return { n: flashes.length, pt: gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE), W: Math.max(0.6*Math.pow(10, logLa), 5e-3)*5.67, last: lastScene && [lastScene.W, lastScene.H], err: gl.getError() }; }, get storms(){ return storms ? [storms.length, nearStorms.length] : null; }, get moonHi(){ return moonHiState; }, digestMs(){ if (!lumCtx) return -1; const t0 = performance.now(); for (let i = 0; i < 10; i++) lumDigest(); return [(performance.now() - t0)/10, lumCtx.lw*lumCtx.lh, lumCtx.glare.length]; }, pace(m, now){ paceControl(m, now); return scale; }, cpu(n){ const t0 = performance.now(); for (let i = 0; i < n; i++) draw(scale || 1, performance.now(), false); return (performance.now() - t0)/n; }, get stillScale(){ return stillScale; }, get lumAsync(){ return lumAsync && lumChecked; }, get stillCost(){ return stillCost; },
+  get targetLL(){ return [Math.asin(R[2][1])/D2R, Math.atan2(R[2][0], R[2][2])/D2R]; }, get eye(){ return view().cam; } };
+}
+</script>
+</body>
+</html>
