@@ -60,7 +60,7 @@ uniform float uNoCloud;             // test hook
 uniform float uQ;                   // 1: still frame (full quality), 0: moving (lighter marching)
 uniform float uTexR;                // elevation-map texels per radian
 uniform vec3  uMonth;                // month a, month b (0-11), blend
-uniform float uLive, uLiveAge;       // live cloud map loaded?, its age (hours)
+uniform float uLive, uLiveAge;       // live cloud map: 0 none, 1 read from the outside feed, 2 this project's own; its age (hours)
 
 const float PI = 3.14159265359;
 const float FL  = 0.0033528107;           // WGS84 flattening
@@ -256,7 +256,7 @@ vec3 cwarp(vec3 p, float lat){
 }
 float cfrac(vec3 pw, float lod, float lat){                // cloud fraction 0..1 from the map
   float c = cmap(uvOf(pw), lod);
-  c *= 0.45 + 0.55*smoothstep(-74.0, -64.0, lat);           // the map's Antarctic ice brightness is not cloud
+  if (uLive < 1.5) c *= 0.45 + 0.55*smoothstep(-74.0, -64.0, lat);   // the stored map's Antarctic ice brightness is not cloud
   return clamp((c - 0.06)/0.94, 0.0, 1.0);
 }
 // optical thickness that goes with a cloud fraction
@@ -1871,7 +1871,7 @@ function uniforms(v, w, h, pix, mode){
     const f = mo + (dt_.getUTCDate() - 1 + dt_.getUTCHours()/24)/dim - 0.5, m0 = Math.floor(f);
     gl.uniform3f(U.uMonth, (m0 + 12) % 12, (m0 + 13) % 12, f - m0); }
   const liveAge = liveTime ? (nowMs() - liveTime)/3600000 : 1e9;
-  gl.uniform1f(U.uLive, liveAge < 36 ? 1 : 0); gl.uniform1f(U.uLiveAge, Math.max(0, liveAge));
+  gl.uniform1f(U.uLive, liveAge < 36 ? liveKind : 0); gl.uniform1f(U.uLiveAge, Math.max(0, liveAge));
   gl.uniform4fv(U.uFlow, S.wx.flow); gl.uniform3fv(U.uOff, S.wx.off); gl.uniform4fv(U.uStorm, S.wx.storms);
   gl.uniform1f(U.uNoCloud, window.__noClouds ? 1 : NANTEST ? 2 : 0); gl.uniform1f(U.uQ, mode === 0 && quality ? 1 : 0);
   gl.uniform1f(U.uMoonHi, moonHiNow()); gl.uniform1f(U.uKp, kp); gl.uniform3fv(U.uEcl, S.ecl);
@@ -2234,11 +2234,12 @@ function wantMoonHi(){
 const moonHiNow = () => moonHiState === 2 ? Math.min(1, (performance.now() - moonHiT0)/600) : 0;
 
 /* ------------------------------------------------------------------ live clouds (when hosted online) */
-// Latest global cloud map, rebuilt every 3 h from EUMETSAT geostationary imagery (matteason/live-cloud-maps, CORS-enabled).
-// Kept in the browser cache for offline use; ignored if older than 36 h. A page hosted inside Claude is not allowed
-// to fetch outside data, so there it silently falls back to the stored map; on its own address it is live.
+// Today's clouds. First choice: this project's own hourly map (see loadOwn below). Stand-in when that is stale or out of
+// reach: an outside feed rebuilt every 3 h from EUMETSAT geostationary imagery (matteason/live-cloud-maps), which has to be
+// read with care (liveToCloud). Either is kept in the browser cache for offline use and ignored once older than 36 h. A page
+// hosted inside Claude is not allowed to fetch outside data, so there it silently falls back to the stored map.
 const LIVE_URL = 'https://clouds.matteason.co.uk/images/4096x2048/clouds.jpg';
-let liveTime = 0, liveTex = null;
+let liveTime = 0, liveTex = null, liveKind = 0, credited = false;
 const credit = document.createElement('div');
 credit.textContent = 'Contains modified EUMETSAT data';
 credit.style.cssText = 'position:fixed;left:0;right:0;bottom:calc(10px + env(safe-area-inset-bottom));text-align:center;font:11px -apple-system,system-ui,sans-serif;color:rgba(255,255,255,0.55);pointer-events:none;opacity:0;transition:opacity 1.5s';
@@ -2365,8 +2366,53 @@ function grayOf(src, w, h){                              // a picture's brightne
   for (let i = 0; i < o.length; i++) o[i] = d[i*4];
   c.width = c.height = 0; return o;
 }
+function useCloud(cloud, LW, LH, t, kind){                // puts a finished cloud map (one byte a pixel) to use
+  const tx = gl.createTexture(); gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, tx);
+  if (liveTex) gl.deleteTexture(liveTex);                 // (the map it replaces)
+  liveTex = tx;
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, LW, LH, 0, gl.RED, gl.UNSIGNED_BYTE, cloud);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.useProgram(P); gl.uniform1i(U.tLive, 10);
+  { const sm = new Uint8ClampedArray(360*180*4), f = LW/360;                  // a 1-degree copy, for placing thunderstorms
+    for (let j = 0; j < 180; j++) for (let i = 0; i < 360; i++) sm[(j*360 + i)*4] = cloud[Math.floor((j + 0.5)*f)*LW + Math.floor((i + 0.5)*f)];
+    smallMaps.tCloud = sm; storms = null; }
+  liveTime = t; liveKind = kind; touch();
+}
+// This project's own cloud map: made every hour by a job in its repository (tools/clouds.py) from NOAA's mosaic of the
+// weather satellites, in visible light where it is day and infrared where it is night, and published on the
+// repository's "live" branch. It arrives in the form the shader reads, so it is used as it comes. The last one is kept
+// for offline use. True if the map now shown is this one and under 6 hours old.
+const OWN_URL = 'https://raw.githubusercontent.com/adrimayy/earth-now/live/';
+async function loadOwn(){
+  try {
+    let cache = null; try { cache = await caches.open('earth-live'); } catch(e){}
+    const timeOf = async r => { try { return Date.parse((await r.clone().json()).time) || 0; } catch(e){ return 0; } };
+    const kept = cache ? await cache.match(OWN_URL + 'clouds.json') : null;
+    let t = kept ? await timeOf(kept) : 0, pic = t && cache ? await cache.match(OWN_URL + 'clouds.jpg') : null;
+    if (!pic) t = 0;
+    try {
+      const r = await fetch(OWN_URL + 'clouds.json', {mode: 'cors', cache: 'no-cache'}), tn = r.ok ? await timeOf(r) : 0;
+      if (tn > t){
+        const q = await fetch(OWN_URL + 'clouds.jpg?t=' + tn, {mode: 'cors'});
+        if (q.ok){ if (cache){ await cache.put(OWN_URL + 'clouds.jpg', q.clone()); await cache.put(OWN_URL + 'clouds.json', r.clone()); } pic = q; t = tn; }
+      }
+    } catch(e){}
+    if (!pic || Date.now() - t > 36*3600e3) return false;
+    if (!(liveKind === 2 && t === liveTime) && t > liveTime){
+      const bmp = await createImageBitmap(await pic.blob());
+      const LW = lowMem ? 2048 : 4096, LH = LW/2;
+      useCloud(grayOf(bmp, LW, LH), LW, LH, t, 2);
+      if (bmp.close) bmp.close();
+    }
+    return liveKind === 2 && Date.now() - liveTime < 6*3600e3;
+  } catch(e){ return false; }
+}
 async function loadLive(){
   try {
+    if (await loadOwn()) return;                          // (the outside feed below is only the stand-in when that one is stale or unreachable)
     let cache = null; try { cache = await caches.open('earth-live'); } catch(e){}
     let resp = cache ? await cache.match(LIVE_URL) : null;
     let t = resp ? Date.parse(resp.headers.get('last-modified') || '') || 0 : 0;
@@ -2376,7 +2422,7 @@ async function loadLive(){
         if (r.ok){ if (cache) await cache.put(LIVE_URL, r.clone()); resp = r; t = Date.parse(r.headers.get('last-modified') || '') || Date.now(); }
       } catch(e){}
     }
-    if (!resp || t === liveTime) return;
+    if (!resp || t <= liveTime) return;
     if (!(rawImgs.tCloud && rawImgs.tWater && rawImgs.tTopo)){ setTimeout(loadLive, 3000); return; }   // (the stored maps are needed to read it)
     const bmp = await createImageBitmap(await resp.blob());
     const LW = lowMem ? 2048 : 4096, LH = LW/2;
@@ -2384,20 +2430,9 @@ async function loadLive(){
     a.v = grayOf(bmp, LW, LH); await pause(); a.stored = grayOf(rawImgs.tCloud, LW, LH); await pause();
     a.water = grayOf(rawImgs.tWater, 2048, 1024); await pause(); a.elev = grayOf(rawImgs.tTopo, 2048, 1024); await pause();
     const cloud = await liveToCloudAside(a);
-    const tx = gl.createTexture(); gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, tx);
-    if (liveTex) gl.deleteTexture(liveTex);               // (the map it replaces)
-    liveTex = tx;
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, LW, LH, 0, gl.RED, gl.UNSIGNED_BYTE, cloud);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.useProgram(P); gl.uniform1i(U.tLive, 10);
-    if (!liveTime) showCredit();
-    { const sm = new Uint8ClampedArray(360*180*4), f = LW/360;                  // a 1-degree copy, for placing thunderstorms
-      for (let j = 0; j < 180; j++) for (let i = 0; i < 360; i++) sm[(j*360 + i)*4] = cloud[Math.floor((j + 0.5)*f)*LW + Math.floor((i + 0.5)*f)];
-      smallMaps.tCloud = sm; storms = null; }
-    liveTime = t; touch();
+    if (t <= liveTime) return;                            // (a newer map arrived meanwhile)
+    useCloud(cloud, LW, LH, t, 1);
+    if (!credited){ credited = true; showCredit(); }
   } catch(e){}
 }
 setTimeout(loadLive, 1500); setInterval(loadLive, 30*60e3);
@@ -2420,7 +2455,7 @@ window.__earth = { get alt(){return alt;}, set alt(v){alt=v; touch();}, get pitc
   dirAt(x, y){ const v = view(); return norm(sub(add(sc(v.vr, x*CSS_PIX), sc(v.vu, y*CSS_PIX)), v.vb)); },
   bench2(n){ const px = new Uint8Array(4); const t0 = performance.now(); for (let i = 0; i < n; i++){ draw(1, performance.now(), false); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - t0)/n; },
   bench(n){ const px = new Uint8Array(4); const t0 = performance.now(); for (let i = 0; i < n; i++){ draw(1, performance.now()); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - t0)/n; },
-  get scale(){ return scale; }, set scale(v){ scale = v; }, get flashes(){ return flashes.length; }, flashAt(lat, lon, I, ms, sig){ const la = lat*D2R, lo = lon*D2R, rr = 1 + 9*KM, t = performance.now(); flashes.push({ I: I || 4e8, strokes: [[t, 1]], hold: 1, end: t + (ms || 5000), parts: [{ pos: [rr*Math.cos(la)*Math.sin(lo), rr*Math.sin(la), rr*Math.cos(la)*Math.cos(lo)], sig: (sig || 12)*KM, w: [1] }] }); }, get kp(){ return kp; }, set kp(v){ kp = v; touch(); }, readKp, get flashDbg(){ return { n: flashes.length, pt: gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE), W: Math.max(0.6*Math.pow(10, logLa), 5e-3)*5.67, last: lastScene && [lastScene.W, lastScene.H], err: gl.getError() }; }, get storms(){ return storms ? [storms.length, nearStorms.length] : null; }, get moonHi(){ return moonHiState; }, digestMs(){ if (!lumCtx) return -1; const t0 = performance.now(); for (let i = 0; i < 10; i++) lumDigest(); return [(performance.now() - t0)/10, lumCtx.lw*lumCtx.lh, lumCtx.glare.length]; }, pace(m, now){ paceControl(m, now); return scale; }, cpu(n){ const t0 = performance.now(); for (let i = 0; i < n; i++) draw(scale || 1, performance.now(), false); return (performance.now() - t0)/n; }, get stillScale(){ return stillScale; }, get lumAsync(){ return lumAsync && lumChecked; }, get stillCost(){ return stillCost; },
+  get scale(){ return scale; }, set scale(v){ scale = v; }, get live(){ return { kind: liveKind, time: liveTime }; }, get flashes(){ return flashes.length; }, flashAt(lat, lon, I, ms, sig){ const la = lat*D2R, lo = lon*D2R, rr = 1 + 9*KM, t = performance.now(); flashes.push({ I: I || 4e8, strokes: [[t, 1]], hold: 1, end: t + (ms || 5000), parts: [{ pos: [rr*Math.cos(la)*Math.sin(lo), rr*Math.sin(la), rr*Math.cos(la)*Math.cos(lo)], sig: (sig || 12)*KM, w: [1] }] }); }, get kp(){ return kp; }, set kp(v){ kp = v; touch(); }, readKp, get flashDbg(){ return { n: flashes.length, pt: gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE), W: Math.max(0.6*Math.pow(10, logLa), 5e-3)*5.67, last: lastScene && [lastScene.W, lastScene.H], err: gl.getError() }; }, get storms(){ return storms ? [storms.length, nearStorms.length] : null; }, get moonHi(){ return moonHiState; }, digestMs(){ if (!lumCtx) return -1; const t0 = performance.now(); for (let i = 0; i < 10; i++) lumDigest(); return [(performance.now() - t0)/10, lumCtx.lw*lumCtx.lh, lumCtx.glare.length]; }, pace(m, now){ paceControl(m, now); return scale; }, cpu(n){ const t0 = performance.now(); for (let i = 0; i < n; i++) draw(scale || 1, performance.now(), false); return (performance.now() - t0)/n; }, get stillScale(){ return stillScale; }, get lumAsync(){ return lumAsync && lumChecked; }, get stillCost(){ return stillCost; },
   get targetLL(){ return [Math.asin(R[2][1])/D2R, Math.atan2(R[2][0], R[2][2])/D2R]; }, get eye(){ return view().cam; } };
 }
 </script>

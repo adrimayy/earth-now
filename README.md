@@ -21,22 +21,33 @@ sw.js          Keeps it working with no internet
 manifest.json  Lets a phone add it to the home screen
 icon.png       The home-screen icon
 tex/           Maps of the Earth and Moon, the Milky Way, and the star list
+tools/clouds.py               Builds the hourly cloud map
+.github/workflows/clouds.yml  Runs it every hour on GitHub
 ```
 
 No build step. Open `index.html` from any web server to run it.
 
 ## Changing it
 
-When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v18` → `earth-now-v19`). Otherwise phones that already hold the app keep the old copy.
+When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v19` → `earth-now-v20`). Otherwise phones that already hold the app keep the old copy.
 
 ## Clouds
 
-With no internet the app shows a stored cloud map, carried slowly by the winds: realistic, but not today's weather.
+Online, the app shows this hour's clouds. A job in this repository builds the map every hour (`tools/clouds.py`, run by `.github/workflows/clouds.yml`) and puts it on the `live` branch, where the app picks it up. The map is about an hour old when it appears. The job reads two public NOAA sources:
 
-Online it fetches a current picture every three hours from [live-cloud-maps](https://github.com/matteason/live-cloud-maps) (contains modified EUMETSAT data). That picture is a satellite heat picture, not a map of cloud, so the app first takes off the coldness of the clear ground in each region and counts only what is colder as cloud. Two limits follow from the feed:
+- **The hourly mosaic of the weather satellites** (GMGSI: GOES-West, GOES-East, two Meteosats and Himawari). In daylight, cloud is whatever is brighter in visible light than that place's clear-sky look, which is the darkest it has been at the same hour over the past week. At night, cloud is whatever is colder in infrared than the week's warmest reading.
+- **The GFS weather model**, for what the satellites cannot give: cloud poleward of about 60 to 65°, low cloud at night (it is as warm as the ground, so infrared does not see it), the ground temperature (so that cold air behind a front is not read as cloud), and where snow and ice lie.
 
-- Where the ground itself is colder than about −7 °C the picture is maxed out and cloud cannot be told from ground. There, and poleward of about 65°, the stored map is used. In northern winter that is most land north of 40°.
-- Low cloud about as warm as the sea under it does not show in a heat picture and is left out.
+Limits:
+
+- The night side is less exact than the day side. A night cloud's brightness is the average for cloud that cold, and low cloud at night and all cloud near the poles are the model's forecast, not an observation.
+- Over snow and ice, cloud is hard to tell from the ground and is underestimated.
+- A place that has been cloudy at the same hour all week has no clear-sky look to compare with, so thin cloud there can be missed.
+- Where two satellites' views meet (near 106° W, 38° W, 23° E, 93° E and 178° W) a faint straight step can show, mostly at a low Sun.
+
+If that map is unreachable or more than 6 hours old, the app falls back to a 3-hourly picture from [live-cloud-maps](https://github.com/matteason/live-cloud-maps) (contains modified EUMETSAT data). That one is a heat picture, not a map of cloud, and cannot tell cloud from ground colder than about −7 °C, so it is only a stand-in. With no internet the app keeps showing the last map it received for 36 hours, then a stored cloud map carried slowly by the winds: realistic, but not today's weather.
+
+To stop the job: Actions tab → clouds → ⋯ → Disable workflow.
 
 The aurora's strength follows NOAA's planetary K index when it can be fetched; otherwise an ordinary quiet night is shown.
 
@@ -44,7 +55,7 @@ The aurora's strength follows NOAA's planetary K index when it can be fetched; o
 
 - Earth by day, by month, at night, its heights and stored clouds: NASA Blue Marble and Black Marble.
 - Moon heights and colour: NASA's Lunar Reconnaissance Orbiter (LOLA and LROC).
-- Live clouds: live-cloud-maps by Matt Eason, from EUMETSAT data.
+- Live clouds: made here from NOAA's GMGSI satellite mosaic and GFS model (NOAA Open Data Dissemination). The data is changed in the making and this project is not endorsed by NOAA. Stand-in: live-cloud-maps by Matt Eason, from EUMETSAT data.
 - Aurora activity: NOAA Space Weather Prediction Center.
 
 ## Limits
