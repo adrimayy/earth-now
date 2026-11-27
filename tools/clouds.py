@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Builds Earth Now's cloud map for the latest hour: clouds.jpg (4096 x 2048, 180 W at the left edge, north up) and
-clouds.json (the time it shows).
+clouds.json (the time it shows and the names of that hour's pictures), with the height of the cloud tops beside it.
 
 What goes in, all public and free:
   * NOAA's Global Mosaic of Geostationary Satellite Imagery (GMGSI): one picture an hour of the whole Earth between
@@ -17,6 +17,7 @@ How cloud is read:
   * At night, from the infrared pictures: how much colder a place is than the warmest it has been at this hour over
     the last week, turned into brightness with the relation measured on the daylit side of the same picture. Low cloud,
     which is as warm as the ground and so invisible that way, is taken from the model there.
+  * How high the tops are comes from how much colder they are than the ground (6.5 K for every kilometre).
   * The value written is the one the app's shader expects: 0 = clear, else 255*(0.06 + 0.94*c), where c is the cloud
     amount whose brightness the shader draws as c^1.15 * mix(0.5, 0.9, smoothstep(0.2, 0.85, c)).
 
@@ -32,6 +33,7 @@ GMGSI = 'https://noaa-gmgsi-pds.s3.amazonaws.com'
 GFS = 'https://noaa-gfs-bdp-pds.s3.amazonaws.com'
 W, H = 4096, 2048
 DAYS = 7                                   # how far back the clear-sky look is taken from
+TOP_KM = 13.0                              # the heights picture runs from 0 (black) to this (white)
 SATS = np.array([-137.0, -75.2, 0.0, 45.5, 140.7])   # where the five satellites sit (degrees east)
 UTC = dt.timezone.utc
 
@@ -323,9 +325,14 @@ def convert(t, lat, lon, lw, vis, sw, lw_clear, vis_clear_rho, water, red, model
             gate = np.maximum(gate, ss(0.03, 0.08, np.where((sw > 0) & (lw > 0), r39, 0.0)))
         Rv = Rv + soft*(np.maximum(Ri, Rv*gate) - Rv)
     R = Rv*wv + Rn*(1.0 - wv)
+    # ---- how high the tops are: air cools about 6.5 K with every kilometre, so a top that much colder than the ground
+    # stands that much higher (a count is half a kelvin down from 333 K; clear air reads about 3 K below the ground).
+    # Thin high cloud lets the warm ground shine through and reads too low; cloud no colder than the ground is low cloud.
+    ground = model['ts'] if model is not None and 'ts' in model else (333.0 - 0.5*clear) + 3.0
+    top = np.where(lw > 0, np.clip((ground - (333.0 - 0.5*lw))/6.5, 1.0, TOP_KM), 2.0).astype(np.float32)
     # ---- how far to trust it: near the edge of a satellite's view the ground is seen at a grazing angle, then not at all
     trust = ss(0.22, 0.34, muv)*(lw > 0)
-    return R.astype(np.float32), trust.astype(np.float32), dict(Rv=Rv, wv=wv, Ri=Ri, low=low, m=m)
+    return R.astype(np.float32), trust.astype(np.float32), dict(Rv=Rv, wv=wv, Ri=Ri, low=low, m=m, top=top)
 
 
 def deseam(R, lat, lon):
@@ -395,9 +402,9 @@ def model_cloud(model, R_sat, trust, lat):
     return np.clip(Rm*k, 0.0, 0.93).astype(np.float32)
 
 
-def compose(R, trust, lat, lon, model_raw, previous=None):
-    """The finished map (uint8, W x H): the satellites where they see, the model beyond, last hour's map if there is
-    no model."""
+def compose(R, trust, top, lat, lon, model_raw, previous=None):
+    """The finished pictures (uint8): the cloud map (W x H) and the height of the cloud tops (W/2 x H/2, 0 to TOP_KM).
+    The satellites where they see, the model beyond, last hour's map if there is no model."""
     num, _ = to_map(R*trust, lat, lon)
     den, inside = to_map(trust, lat, lon)
     den = den*inside[:, None]
@@ -415,7 +422,21 @@ def compose(R, trust, lat, lon, model_raw, previous=None):
         other = np.zeros_like(Rs)
     Rf = Rs*den + other*(1.0 - den)
     c = amount(np.clip(Rf, 0.0, 0.93))
-    return np.round(255.0*(0.06 + 0.94*np.where(c > 0.03, c, 0.0))).astype(np.uint8)       # clear sky is 15, not 0: kinder to JPEG
+    cloud = np.round(255.0*(0.06 + 0.94*np.where(c > 0.03, c, 0.0))).astype(np.uint8)       # clear sky is 15, not 0: kinder to JPEG
+    # Heights: each place takes the height of the cloud around it, weighted by how much cloud there is, and smoothed
+    # over about 25 km (the app wants tops that roll gently; a hard step would stand up as a cliff). Clear places take
+    # the height of the nearest cloud, 2 km if there is none near. Beyond the satellites, thicker model cloud is taller.
+    wt = R*trust
+    hn, _ = to_map(top*wt, lat, lon)
+    hd, _ = to_map(wt, lat, lon)
+    blur = lambda a, sg: ndimage.gaussian_filter(a, sg, mode=('nearest', 'wrap'))
+    near = (blur(hn, 2.5) + 2.0e-4)/(blur(hd, 2.5) + 1.0e-4)
+    wide = (blur(hn, 12.0) + 2.0e-4)/(blur(hd, 12.0) + 1.0e-4)
+    k = ss(0.0, 0.02, blur(hd, 2.5))
+    tops = near*k + wide*(1.0 - k)
+    tops = tops*den + (2.0 + 6.0*other/0.93)*(1.0 - den)
+    tops = tops.reshape(H//2, 2, W//2, 2).mean(axis=(1, 3))
+    return cloud, np.round(255.0*np.clip(tops/TOP_KM, 0.0, 1.0)).astype(np.uint8)
 
 
 def main():
@@ -469,20 +490,25 @@ def main():
     wg, rg = on_grid(water, lat, lon), on_grid(red, lat, lon)
     model_raw = gfs(t)
     model = {k: on_grid(model_raw[k], lat, lon, lon0=0.0) for k in ('snod', 'ice', 'lc', 'ts')} if model_raw else None
-    R, trust, _ = convert(when, lat, lon, lw, vis, sw, lw_clear, vis_clear, wg, rg, model)
+    R, trust, more = convert(when, lat, lon, lw, vis, sw, lw_clear, vis_clear, wg, rg, model)
     R = deseam(R, lat, lon)
     previous = None
     if model_raw is None and args.previous and os.path.exists(args.previous):
         previous = np.asarray(Image.open(args.previous).convert('L').resize((W, H)))
-    out = compose(R, trust, lat, lon, model_raw, previous)
+    out, tops = compose(R, trust, more['top'], lat, lon, model_raw, previous)
     os.makedirs(args.out, exist_ok=True)
+    # Each hour's pictures get their own names, listed in clouds.json: a fixed name can be answered from a server's
+    # short-lived copy of the hour before. clouds.jpg stays as well, for copies of the app from before this.
+    stamp = when.strftime('%Y%m%dT%H%M')
     Image.fromarray(out).save(os.path.join(args.out, 'clouds.jpg'), quality=82, optimize=True)
+    Image.fromarray(out).save(os.path.join(args.out, 'clouds-%s.jpg' % stamp), quality=82, optimize=True)
+    Image.fromarray(tops).save(os.path.join(args.out, 'tops-%s.jpg' % stamp), quality=85, optimize=True)
     with open(os.path.join(args.out, 'README.md'), 'w') as f:
         f.write('This branch holds only the latest cloud map for Earth Now. A job on the main branch (tools/clouds.py) replaces it every hour; nothing here is edited by hand.\n')
     with open(os.path.join(args.out, 'clouds.json'), 'w') as f:
-        json.dump({'time': when.strftime('%Y-%m-%dT%H:%M:%SZ'), 'made': dt.datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        json.dump({'time': when.strftime('%Y-%m-%dT%H:%M:%SZ'), 'file': 'clouds-%s.jpg' % stamp, 'tops': 'tops-%s.jpg' % stamp, 'top_km': TOP_KM, 'made': dt.datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
                    'days': days, 'visible': vis is not None, 'model': model_raw is not None}, f)
-    log('written: cloud over %.0f%% of the map' % (100.0*(out > 15).mean()))
+    log('written: cloud over %.0f%% of the map; tops: half below %.1f km, a tenth above %.1f km' % (100.0*(out > 15).mean(), np.median(tops)/255.0*TOP_KM, np.percentile(tops, 90)/255.0*TOP_KM))
     return 0
 
 
