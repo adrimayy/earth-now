@@ -216,30 +216,6 @@ float sfbm(vec3 p, float oct, float gain){
   }
   return 0.5 + 0.5*s/max(t, 1e-3)*1.6;
 }
-// billowy (cauliflower) detail: 1 - |noise|
-float billow(vec3 p, float oct){
-  float a = 0.5, s = 0.0, t = 0.0;
-  for (int i = 0; i < 7; i++){
-    float w = clamp(oct - float(i), 0.0, 1.0); if (w <= 0.0) break;
-    s += a*w*(1.0 - abs(snoise(p))); t += a*w; p = p*2.07 + vec3(4.7, 1.3, 9.1); a *= 0.55;
-  }
-  return t > 0.0 ? s/t : 0.5;
-}
-// cellular F1 (2x2x2 nearest cells, jittered) for marine stratocumulus cells
-vec3 gCell;                                                // (set by worley: from here to the nearest cell's middle)
-vec3 gVh = vec3(0.0); float gSq = 1.0;                     // (set for worley: lengths along gVh count gSq times as long; 1 = plain distance)
-float worley(vec3 P){
-  vec3 Pi = floor(P), Pf = fract(P), o = step(0.5, Pf) - 1.0; float d = 9.0; gCell = vec3(0.0);
-  for (int k = 0; k < 8; k++){
-    vec3 c = o + vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1));
-    vec3 cc = m289(Pi + c);
-    vec4 h = perm(perm(perm(vec4(cc.x)) + cc.y) + cc.z + vec4(0.0, 17.0, 41.0, 0.0));
-    vec3 jit = fract(h.xyz*(1.0/41.0))*0.8 + 0.1;
-    vec3 r = c + jit - Pf; float al = dot(r, gVh), dd = dot(r, r) - (1.0 - gSq*gSq)*al*al;
-    if (dd < d){ d = dd; gCell = r; }
-  }
-  return sqrt(d);
-}
 // bright but shallow: marine stratocumulus decks over cold water just west of the subtropical continents
 // (off California, Peru, Namibia). Everywhere else, brighter cloud is taken to be deeper cloud.
 float lowDeck(vec3 p){
@@ -275,57 +251,53 @@ float topAt(vec3 pw, float lod, float lat, float deck){
   return topOfC(cfrac(pw, l + 0.6, lat), deck);
 }
 // Returns cloud OPTICAL THICKNESS tau.
-// Base: a real global cloud field (NASA Blue Marble cloud layer, from satellite). It is not today's weather,
-// but it has real weather's structure: cyclones, fronts, cloud streets, trade cumulus, stratocumulus decks.
-// Below the map's ~10 km resolution it resolves into puffs and streaks.
-float gPuff; vec3 gPuffUp;                                 // (set by cloudsW: how much of this spot is a cumulus puff, and its uphill direction x steepness)
+// Base: a real global cloud field: this hour's map when there is one, else the NASA Blue Marble cloud layer (not
+// today's weather, but with real weather's structure: cyclones, fronts, cloud streets, decks).
+// The map says how much cloud each ~10 km spot holds. Closer than that there is ONE look for all cloud: it is broken
+// up the way real cloud is, into ragged clumps of every size down to what a pixel shows, so that exactly the map's
+// share of the spot is covered - scattered bits where the map says little, a sheet with holes where it says much, a
+// solid lumpy sheet where it says all. (Before, low cloud was drawn as round heaps and other cloud as streaks: two
+// invented kinds, with nothing in the data to say which was which.)
 float gObl = 0.0;                                          // (set for cloudsW: tangent of the angle the cloud is seen at, from straight down)
+vec3 gCq; float gCoct;                                     // (set by cloudsW, for lighting the clumps: where its texture was read, at how many octaves; 0 = none)
+// the texture: close to a normal spread, mean 0 and deviation 1 at any level of detail (0.359: one octave's own deviation)
+float cloudZ(vec3 q, float oct){
+  float a = 0.5, s = 0.0, v = 0.0;
+  for (int i = 0; i < 8; i++){
+    float w = clamp(oct - float(i), 0.0, 1.0); if (w <= 0.0) break;
+    s += a*w*snoise(q); v += a*a*w*w; q = q*2.02 + vec3(13.1, 7.3, 3.7); a *= 0.5;
+  }
+  return s/(0.359*sqrt(max(v, 1.0e-6)));
+}
 float cloudsW(vec3 p, vec3 pw, float oct){
-  gPuff = 0.0; gPuffUp = vec3(0.0);
+  gCoct = 0.0; gCq = vec3(0.0);
   float lat = degrees(asin(clamp(p.y, -1., 1.)));
   float fp = 0.5/(7.0*exp2(oct));                          // pixel footprint (rad) implied by oct
   float lod = log2(max(fp*652.0, 1.0));
   float c = cfrac(pw, lod, lat);
-  // The map value is the cloud FRACTION in each ~10 km pixel. Zoomed past that, it resolves into separate
-  // puffs covering that fraction (fair-weather cumulus), while solid decks stay solid.
-  float Rmax = mix(0.5, 0.9, smoothstep(0.2, 0.85, c));     // scattered cumulus are thinner than decks
-  float cov = c;
-  // individual cumulus ~4 km apart, sized so their area matches the map's fraction, grouped into clusters,
-  // with lumpy (cauliflower) edges; only once a cell spans a few pixels (otherwise the fraction IS the look)
-  const float CU = 650.0*2.5;                                // cells per radian (~4 km)
-  float pxPerCell = (1.0/CU)/fp;
-  // cumulus fields are mostly a tropical/subtropical-ocean look; mid-latitude cloud is mostly layered (fronts)
-  float cuType = mix(0.25, 1.0, exp(-sq(lat/30.0)));
-  float aC = smoothstep(2.0, 5.0, pxPerCell)*(1.0 - smoothstep(0.88, 0.98, c))*cuType;
-  if (uTops > 0.5 && aC > 0.0) aC *= 1.0 - smoothstep(3.0*KM, 5.5*KM, topAt(pw, lod, lat, 0.0));   // heaps are low cloud: what is measured high is layered
-  aC *= 1.0 - smoothstep(1.5, 3.5, gObl);                    // seen nearly edge-on, a field of heaps is one white sheet: no separate discs
-  // layered cloud: soft, wind-streaked texture instead of puffs
-  float sOct = clamp(log2((1.0/650.0)/(fp*3.0)) + 1.0, 0.0, 5.0);
-  if (sOct > 0.0){
-    vec3 qs = pw*650.0*vec3(1.0, 2.2, 1.0);
-    float sd = sfbm(qs + 0.4*vec3(snoise(qs*0.3), snoise(qs*0.3 + 5.0), 0.0), sOct, 0.5);
-    cov = clamp(c + (sd - 0.5)*0.9*(1.0 - abs(2.0*c - 1.0))*smoothstep(0.0, 1.0, sOct), 0.0, 1.0);
+  float Rmax = mix(0.5, 0.9, smoothstep(0.2, 0.85, c));     // a spot with little cloud holds thinner cloud than a deck
+  float R = pow(max(c, 0.0), 1.15)*Rmax;                    // the spot's average reflectance: all there is to see from afar
+  // clumps from ~10 km down, coming in as they grow to a few pixels (before that, the average IS the look)
+  float sOct = clamp(log2((1.0/650.0)/(fp*3.0)) + 1.0, 0.0, 8.0);
+  if (sOct > 0.0 && c > 0.004){
+    vec3 qs = pw*650.0*vec3(1.0, 1.4, 1.0);                  // (a little longer east-west than north-south, as the winds draw cloud out)
+    qs += 0.4*vec3(snoise(qs*0.3), snoise(qs*0.3 + 5.0), 0.0);
+    float z = cloudZ(qs, sOct);
+    // seen from the side, the clumps' own height hides the gaps behind them
+    float cv = clamp(1.0 - pow(1.0 - min(c, 1.0), 1.0 + 0.5*gObl), 0.004, 0.996);
+    float zth = -4.91*(pow(cv, 0.14) - pow(1.0 - cv, 0.14));  // cloud where z > zth: that is the share cv of the spot
+    // crisp-edged for low cloud, wispy for what is measured high
+    float soft = uTops > 0.5 ? mix(0.28, 0.75, smoothstep(5.0*KM, 9.0*KM, topAt(pw, lod, lat, 0.0))) : 0.34;
+    float m = smoothstep(zth - soft, zth + soft, z);
+    // A clump is thick in its middle and thin at its rim, and all of a spot's clumps together reflect what the map
+    // says (ex: how far into a clump an average covered point is).
+    float ex = exp(-0.5*zth*zth)/(2.5066*cv) - zth;
+    float Rk = min(pow(max(c, 1.0e-3), 0.15)*Rmax, 0.93);
+    float Rd = m*Rk*clamp((0.6 + 0.55*max(z - zth + soft, 0.0))/(0.6 + 0.55*(ex + soft)), 0.3, 1.35);
+    R = mix(R, Rd, smoothstep(0.0, 1.0, sOct));
+    gCq = qs; gCoct = sOct;
   }
-  if (aC > 0.0){
-    vec3 qd = pw*CU;
-    float cluster = sfbm(qd*0.18 + 5.0, 3.0, 0.5);
-    float fr = clamp(c*(0.35 + 1.3*cluster), 0.0, 1.0);
-    float r = sqrt(fr/3.1416)*1.2;
-    float lOct = clamp(log2((0.25/CU)/(fp*2.0)) + 2.0, 0.0, 4.0);
-    float lump = lOct > 0.0 ? (sfbm(qd*4.0, lOct, 0.55) - 0.5)*0.22 : 0.0;
-    float F1 = worley(qd + 0.25*vec3(snoise(qd*0.5), snoise(qd*0.5 + 4.0), 0.0));
-    float soft = max(0.03, 1.5/pxPerCell);
-    float puffs = 1.0 - smoothstep(r - soft, r + soft, F1 + lump);
-    // A cumulus is a heap, not a disc: deep and bright in the middle, thin and greyer toward its rim, with the
-    // lumps of its turrets. (Its average stays what the map says, so from afar nothing changes.)
-    float dome = sqrt(clamp(1.0 - (F1 + lump)/max(r, 0.05), 0.0, 1.0)), near = smoothstep(4.0, 10.0, pxPerCell);
-    puffs *= mix(1.0, 0.5 + 0.94*dome, near*(1.0 - smoothstep(0.5, 0.8, fr)));
-    gPuff = aC*near*step(0.5, puffs + 0.5*step(F1 + lump, r))*(1.0 - smoothstep(0.5, 0.8, fr));   // (heaps packed edge to edge are a sheet: no separate domes)
-    // the heap's slope: about as tall as it is wide across (a puff r cells wide rises ~0.6 r cells)
-    gPuffUp = gCell/max(F1, 0.02)*(0.6*0.5/max(dome, 0.25));
-    cov = mix(cov, puffs, aC);
-  }
-  float R = clamp(pow(max(cov, 0.0), 1.15)*Rmax, 0.0, 0.93);   // reflectance of the cloudy part
+  R = clamp(R, 0.0, 0.93);
   return R/(0.075*(1.0 - R));                               // invert two-stream: R -> tau
 }
 float clouds(vec3 p, float oct){ return cloudsW(p, cwarp(p, degrees(asin(clamp(p.y, -1., 1.)))), oct); }
@@ -676,13 +648,9 @@ void main(){
         vec3 pwc = normalize(nc + W);
         float mvc = clamp(dot(nc, -rd), 0.05, 1.0);
         gObl = min(sqrt(1.0 - mvc*mvc)/max(mvc, 0.2), 4.0);
-        // A heap is about as tall as it is wide, so from the side it still looks round, and the near ones hide the gaps
-        // behind them. Drawn flat it would shrink to a dash: so each heap is stretched along the line of sight by as
-        // much as the slant squeezes it (up to 1.8 times; past that the field is fading into one sheet anyway).
-        vec3 vh = rd - nc*dot(rd, nc); gVh = vh/max(length(vh), 1.0e-4); gSq = clamp(mvc, 0.55, 1.0);
         float tauC = cloudsW(nc, pwc, oc);
-        gObl = 0.0; gVh = vec3(0.0); gSq = 1.0;
-        float puffA = gPuff; vec3 puffUp = gPuffUp;               // (kept: the shadow test below calls cloudsW again)
+        gObl = 0.0;
+        vec3 clumpQ = gCq; float clumpOct = gCoct;               // (kept: cloudsW is called again further down)
         // seen at a slant, the path through the cloud is longer: thin cloud looks denser toward the limb
         float Rc = cloudR(tauC/clamp(dot(nc, -rd), 0.3, 1.0));
         float muC = dot(nc, uSun), sA;
@@ -706,17 +674,12 @@ void main(){
             csh = min(csh, 1.0 - 0.85*smoothstep(0.0, 1.5*KM, top - altE(q)));
           }
         }
-        // a cumulus heap is brighter on its sunward side and dimmer on the far one (softened: cloud scatters light around inside)
-        if (puffA > 0.0){
-          float sunH2 = max(1.0 - muC*muC, 0.0);
-          relief *= mix(1.0, clamp(1.0 + 0.6*dot(puffUp, uSun - nc*muC)/max(muC, 0.15), 0.45, 1.6), puffA*step(1.0e-4, sunH2));
-        }
-        // cloud tops are lumpy at every size the eye can make out: each lump lit on its sunward side
-        float fineC = clamp(log2(1.0/(tc*uPix*900.0)) + 1.0, 0.0, uQ > 0.5 ? 3.0 : 1.5);   // (lumps from ~7 km down, as they come to span a pixel; fewer sizes while moving)
-        if (fineC > 0.0 && puffA < 1.0){
-          vec3 sunAlong = uSun - nc*muC, ql = pwc*900.0;
-          float dl = sfbm(ql + sunAlong*0.3, fineC, 0.55) - sfbm(ql - sunAlong*0.3, fineC, 0.55);
-          relief *= clamp(1.0 + 0.6*dl/max(muC, 0.35)*(1.0 - puffA)*smoothstep(0.0, 1.0, fineC), 0.62, 1.4);
+        // each clump is brighter on its sunward side and dimmer on the far one (softened: cloud scatters light around inside)
+        if (clumpOct > 0.0){
+          float o3 = min(clumpOct, uQ > 0.5 ? 4.0 : 2.0);          // (the larger lumps carry the shading; fewer sizes while moving)
+          vec3 dq = (uSun - nc*muC)*vec3(1.0, 1.4, 1.0)*0.35;
+          float dl = cloudZ(clumpQ + dq, o3) - cloudZ(clumpQ - dq, o3);   // thicker toward the Sun: this side faces away
+          relief *= clamp(1.0 - 0.26*dl/max(muC, 0.35)*smoothstep(0.0, 1.0, clumpOct), 0.55, 1.4);
         }
         float wrap = clamp((sA + 0.12)/1.12, 0.0, 1.0)*relief*csh;
         vec3 Ec = uEsun*Tc*visC*solarEclipse(pc);

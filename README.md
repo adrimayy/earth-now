@@ -36,7 +36,7 @@ When `index.html` or anything in `tex/` changes, raise the version in the first 
 Online, the app shows this hour's clouds. A job in this repository builds the map every hour (`tools/clouds.py`, run by `.github/workflows/clouds.yml`) and puts it on the `live` branch, where the app picks it up. The map is about an hour old when it appears. The job reads two public NOAA sources:
 
 - **The hourly mosaic of the weather satellites** (GMGSI: GOES-West, GOES-East, two Meteosats and Himawari). In daylight, cloud is whatever is brighter in visible light than that place's clear-sky look, which is the darkest it has been at the same hour over the past week. At night, cloud is whatever is colder in infrared than the week's warmest reading.
-- **How high the cloud tops are**, from how much colder they are than the ground in the same infrared pictures (about 6.5 °C for every kilometre). The app draws each cloud at that height, and draws separate cumulus heaps only where the cloud is low.
+- **How high the cloud tops are**, from how much colder they are than the ground in the same infrared pictures (about 6.5 °C for every kilometre). The app draws each cloud at that height.
 - **The GFS weather model**, for what the satellites cannot give: cloud poleward of about 60 to 65°, low cloud at night (it is as warm as the ground, so infrared does not see it), the ground temperature (so that cold air behind a front is not read as cloud), and where snow and ice lie.
 
 Limits:
@@ -44,6 +44,7 @@ Limits:
 - The night side is less exact than the day side. A night cloud's brightness is the average for cloud that cold, and low cloud at night and all cloud near the poles are the model's forecast, not an observation.
 - Over snow and ice, cloud is hard to tell from the ground and is underestimated.
 - A place that has been cloudy at the same hour all week has no clear-sky look to compare with, so thin cloud there can be missed.
+- The map says how much cloud each spot of about 10 km holds, not the shape of each cloud. Closer than that, the app fills in one kind of detail everywhere: ragged clumps that cover exactly the measured share of the spot (scattered bits where cloud is sparse, a sheet with holes where there is a lot, a solid lumpy sheet where it is full), lit on the side facing the sun. The individual clumps are not the real ones.
 - Seen from the side, cloud is a lit, lumpy sheet at the right height, not a true volume: towers do not stand up as separate shapes.
 - Thin high cloud lets the warm ground show through and is placed too low.
 - Where two satellites' views meet (near 106° W, 38° W, 23° E, 93° E and 178° W) a faint straight step can show, mostly at a low Sun.
