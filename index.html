@@ -284,54 +284,60 @@ float cloudsW(vec3 p, vec3 pw, float oct){
   float R = pow(max(c, 0.0), 1.15)*Rmax;                    // the spot's average reflectance: all there is to see from afar
   // detail from ~10 km down, coming in as it grows to a few pixels (before that, the average IS the look)
   float sOct = clamp(log2((1.0/650.0)/(fp*3.0)) + 1.0, 0.0, 8.0);
-  if (sOct > 0.0 && c > 0.004){
+  if (sOct > 0.0){
     // ---- which family: from how high the top is and how much cloud there is
     // (without measured heights only the brightest cloud is taken for deep; the rest, like most cloud, for low)
     float hk = uTops > 0.5 ? topAt(pw, lod, lat, 0.0)/KM : 2.0 + 9.0*smoothstep(0.72, 0.9, c)*(1.0 - 0.85*lowDeck(p));
     float high = smoothstep(5.0, 8.5, hk);
-    float wCi = high*(1.0 - smoothstep(0.22, 0.55, c));                           // thin and high: cirrus
-    float flatv = (1.0 - smoothstep(2.0, 3.5, hk))*smoothstep(0.86, 0.97, c);     // low and full: stratus, fog
-    float wBr = (1.0 - smoothstep(2.5, 6.0, hk))*(1.0 - flatv)*(1.0 - wCi);       // low and not full: broken into clumps
-    float wSo = max(1.0 - wCi - wBr, 0.0);                                        // the rest: a continuous sheet
-    float deepv = high*smoothstep(0.45, 0.8, c);                                  // thick and high: storm and front tops
-    vec3 q0 = pw*650.0;
-    float Rd = 0.0, wS = 0.0;
-    if (wBr + wSo > 0.02){
-      vec3 qs = q0*vec3(1.0, 1.4, 1.0);                      // (a little longer east-west than north-south, as the winds draw cloud out)
-      qs += 0.4*vec3(snoise(qs*0.3), snoise(qs*0.3 + 5.0), 0.0);
-      float z = cloudZ(qs, sOct);
-      gCq = qs; gCoct = sOct;
-      if (wBr > 0.02){
-        // seen from the side, the clumps' own height hides the gaps behind them
-        float cv = clamp(1.0 - pow(1.0 - min(c, 1.0), 1.0 + 0.5*gObl), 0.004, 0.996);
-        float zth = -4.91*(pow(cv, 0.14) - pow(1.0 - cv, 0.14));  // cloud where z > zth: that is the share cv of the spot
-        float soft = 0.28;
-        float m = smoothstep(zth - soft, zth + soft, z);
-        // A clump is thick in its middle and thin at its rim, and all of a spot's clumps together reflect what the
-        // map says (ex: how far into a clump an average covered point is).
-        float ex = exp(-0.5*zth*zth)/(2.5066*cv) - zth;
-        float Rk = min(pow(max(c, 1.0e-3), 0.15)*Rmax, 0.93);
-        Rd += wBr*m*Rk*clamp((0.6 + 0.55*max(z - zth + soft, 0.0))/(0.6 + 0.55*(ex + soft)), 0.3, 1.35);
-        wS += wBr;
+    // (thin cloud is at the edge of what the map can detect: it flickers from one 10 km spot to the next and drops
+    // to nothing in places. A veil drawn straight from that shows the map's squares and hard-edged holes, so cirrus
+    // takes its amount from about 50 km around.)
+    float cT = high > 0.01 ? cfrac(pw, max(lod, 2.5), lat) : c;
+    float wCi = high*(1.0 - smoothstep(0.22, 0.55, cT));                          // thin and high: cirrus
+    if (max(c, cT) > 0.004){
+      float flatv = (1.0 - smoothstep(2.0, 3.5, hk))*smoothstep(0.86, 0.97, c);     // low and full: stratus, fog
+      float wBr = (1.0 - smoothstep(2.5, 6.0, hk))*(1.0 - flatv)*(1.0 - wCi);       // low and not full: broken into clumps
+      float wSo = max(1.0 - wCi - wBr, 0.0);                                        // the rest: a continuous sheet
+      float deepv = high*smoothstep(0.45, 0.8, c);                                  // thick and high: storm and front tops
+      vec3 q0 = pw*650.0;
+      float Rd = 0.0, wS = 0.0;
+      if (wBr + wSo > 0.02){
+        vec3 qs = q0*vec3(1.0, 1.4, 1.0);                      // (a little longer east-west than north-south, as the winds draw cloud out)
+        qs += 0.4*vec3(snoise(qs*0.3), snoise(qs*0.3 + 5.0), 0.0);
+        float z = cloudZ(qs, sOct);
+        gCq = qs; gCoct = sOct;
+        if (wBr > 0.02){
+          // seen from the side, the clumps' own height hides the gaps behind them
+          float cv = clamp(1.0 - pow(1.0 - min(c, 1.0), 1.0 + 0.5*gObl), 0.004, 0.996);
+          float zth = -4.91*(pow(cv, 0.14) - pow(1.0 - cv, 0.14));  // cloud where z > zth: that is the share cv of the spot
+          float soft = 0.28;
+          float m = smoothstep(zth - soft, zth + soft, z);
+          // A clump is thick in its middle and thin at its rim, and all of a spot's clumps together reflect what the
+          // map says (ex: how far into a clump an average covered point is).
+          float ex = exp(-0.5*zth*zth)/(2.5066*cv) - zth;
+          float Rk = min(pow(max(c, 1.0e-3), 0.15)*Rmax, 0.93);
+          Rd += wBr*m*Rk*clamp((0.6 + 0.55*max(z - zth + soft, 0.0))/(0.6 + 0.55*(ex + soft)), 0.3, 1.35);
+          wS += wBr;
+        }
+        if (wSo > 0.02){
+          float k = mix(mix(0.16, 0.10, deepv), 0.03, flatv);   // a sheet is uneven in thickness: least so stratus
+          Rd += wSo*R*exp(k*z - 0.5*k*k);
+          wS += wSo;
+        }
       }
-      if (wSo > 0.02){
-        float k = mix(mix(0.16, 0.10, deepv), 0.03, flatv);   // a sheet is uneven in thickness: least so stratus
-        Rd += wSo*R*exp(k*z - 0.5*k*k);
-        wS += wSo;
+      if (wCi > 0.02){
+        // fibres: drawn out some ten times longer east-west (the way the high winds blow) than across, their
+        // direction wandering by 20 or 30 degrees; gathered into bundles some tens of km across
+        vec3 qv = q0*vec3(0.26, 2.4, 0.26);
+        qv.y += 3.6*snoise(q0*0.05) + 1.8*snoise(q0*0.17 + 3.0);
+        float zv = 0.75*cloudZ(qv, max(sOct - 1.3, 0.3)) + 0.66*cloudZ(q0*vec3(0.12, 0.3, 0.12) + 7.7, min(sOct, 3.0));
+        Rd += wCi*pow(cT, 1.15)*mix(0.5, 0.9, smoothstep(0.2, 0.85, cT))*exp(0.8*zv - 0.32);
+        wS += wCi;
       }
+      R = mix(R, Rd/max(wS, 0.02), smoothstep(0.0, 1.0, sOct));
+      gCamp = wBr*0.20 + wSo*mix(0.08, 0.19, deepv)*(1.0 - 0.8*flatv);
+      gCbil = wSo*deepv/max(wBr + wSo, 0.02);
     }
-    if (wCi > 0.02){
-      // fibres: drawn out some ten times longer east-west (the way the high winds blow) than across, their
-      // direction wandering by 20 or 30 degrees; gathered into bundles some tens of km across
-      vec3 qv = q0*vec3(0.26, 2.4, 0.26);
-      qv.y += 3.6*snoise(q0*0.05) + 1.8*snoise(q0*0.17 + 3.0);
-      float zv = 0.75*cloudZ(qv, max(sOct - 1.3, 0.3)) + 0.66*cloudZ(q0*vec3(0.12, 0.3, 0.12) + 7.7, min(sOct, 3.0));
-      Rd += wCi*R*exp(0.8*zv - 0.32);
-      wS += wCi;
-    }
-    R = mix(R, Rd/max(wS, 0.02), smoothstep(0.0, 1.0, sOct));
-    gCamp = wBr*0.20 + wSo*mix(0.08, 0.19, deepv)*(1.0 - 0.8*flatv);
-    gCbil = wSo*deepv/max(wBr + wSo, 0.02);
   }
   R = clamp(R, 0.0, 0.93);
   return R/(0.075*(1.0 - R));                               // invert two-stream: R -> tau
