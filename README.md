@@ -29,14 +29,14 @@ No build step. Open `index.html` from any web server to run it.
 
 ## Changing it
 
-When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v21` → `earth-now-v22`). Otherwise phones that already hold the app keep the old copy.
+When `index.html` or anything in `tex/` changes, raise the version in the first line of `sw.js` (`earth-now-v23` → `earth-now-v24`). Otherwise phones that already hold the app keep the old copy.
 
 ## Clouds
 
 Online, the app shows this hour's clouds. A job in this repository builds the map every hour (`tools/clouds.py`, run by `.github/workflows/clouds.yml`) and puts it on the `live` branch, where the app picks it up. The map is about an hour old when it appears. The job reads two public NOAA sources:
 
 - **The hourly mosaic of the weather satellites** (GMGSI: GOES-West, GOES-East, two Meteosats and Himawari). In daylight, cloud is whatever is brighter in visible light than that place's clear-sky look, which is the darkest it has been at the same hour over the past week. At night, cloud is whatever is colder in infrared than the week's warmest reading.
-- **How high the cloud tops are**, from how much colder they are than the ground in the same infrared pictures (about 6.5 °C for every kilometre). The app draws each cloud at that height.
+- **How high the cloud tops are**, from how much colder they are than the ground in the same infrared pictures (about 6.5 °C for every kilometre). Thin cloud lets the warm ground shine through and reads lower than it is; in daylight the visible picture says how thin it is (dim means thin), and the ground's share of the reading is taken out. The app draws each cloud at that height.
 - **The GFS weather model**, for what the satellites cannot give: cloud poleward of about 60 to 65°, low cloud at night (it is as warm as the ground, so infrared does not see it), the ground temperature (so that cold air behind a front is not read as cloud), and where snow and ice lie.
 
 Limits:
@@ -44,9 +44,18 @@ Limits:
 - The night side is less exact than the day side. A night cloud's brightness is the average for cloud that cold, and low cloud at night and all cloud near the poles are the model's forecast, not an observation.
 - Over snow and ice, cloud is hard to tell from the ground and is underestimated.
 - A place that has been cloudy at the same hour all week has no clear-sky look to compare with, so thin cloud there can be missed.
-- The map says how much cloud each spot of about 10 km holds, not the shape of each cloud. Closer than that, the app fills in one kind of detail everywhere: ragged clumps that cover exactly the measured share of the spot (scattered bits where cloud is sparse, a sheet with holes where there is a lot, a solid lumpy sheet where it is full), lit on the side facing the sun. The individual clumps are not the real ones.
+- The map says how much cloud each spot of about 10 km holds and how high its top is, not the shape of each cloud. Those two measurements tell the families of cloud apart, and closer than 10 km the app draws each family its own way, blending smoothly between them:
+  - thin and high (cirrus): a see-through veil drawn out into streaks;
+  - low and not full (cumulus, broken stratocumulus): separate ragged clumps that cover exactly the measured share of the spot, lit on the side facing the sun;
+  - low and full (stratus, fog): a smooth, even sheet;
+  - thick and high (storms, fronts): a solid white sheet with a bulging top;
+  - in between (middle cloud): a continuous, gently uneven sheet.
+
+  Which family is where is measured. The single clumps and streaks are not the real ones, and cirrus streaks always run roughly east-west.
+- Only one layer is known at each spot. Thin high cloud above low cloud is filed at a height between the two.
+- Without this project's map (the stand-in picture or the stored map) there are no measured heights: only the brightest cloud is drawn as deep, the rest as low, and there is no cirrus.
 - Seen from the side, cloud is a lit, lumpy sheet at the right height, not a true volume: towers do not stand up as separate shapes.
-- Thin high cloud lets the warm ground show through and is placed too low.
+- At night there is no visible picture to say how thin a cloud is, so thin high cloud is still placed too low there and drawn as low cloud.
 - Where two satellites' views meet (near 106° W, 38° W, 23° E, 93° E and 178° W) a faint straight step can show, mostly at a low Sun.
 
 If that map is unreachable or more than 6 hours old, the app falls back to a 3-hourly picture from [live-cloud-maps](https://github.com/matteason/live-cloud-maps) (contains modified EUMETSAT data). That one is a heat picture, not a map of cloud, and cannot tell cloud from ground colder than about −7 °C, so it is only a stand-in. With no internet the app keeps showing the last map it received for 36 hours, then a stored cloud map carried slowly by the winds: realistic, but not today's weather.
