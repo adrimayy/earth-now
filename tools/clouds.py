@@ -461,6 +461,7 @@ def main():
     ap.add_argument('--out', default='site')
     ap.add_argument('--tex', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tex'))
     ap.add_argument('--previous', default=None, help='the last published clouds.jpg, used beyond the satellites if the model is missing')
+    ap.add_argument('--unless', default=None, help='the last published clouds.json: if it already shows the latest hour, write nothing')
     args = ap.parse_args()
     t = dt.datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     got = None
@@ -474,6 +475,17 @@ def main():
         return 0
     lw, lat, lon = got
     log('hour', t.strftime('%Y-%m-%d %H:00 UTC'), lw.shape)
+    if args.unless:
+        # The job is started several times an hour, because a start is sometimes skipped; only the first one after a
+        # new hour's pictures appear has anything to do.
+        try:
+            with open(args.unless) as f:
+                shown = json.load(f).get('time')
+        except (OSError, ValueError, AttributeError):
+            shown = None
+        if shown == (t + dt.timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ'):
+            log('that hour is already published: nothing written')
+            return 0
     vis = mosaic('VIS', t)
     for _ in range(4):                                                      # the visible picture is posted a few minutes after the infrared one
         if vis is not None:
