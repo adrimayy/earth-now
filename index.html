@@ -245,10 +245,14 @@ float topOfC(float c, float deck){ return CBASE + (11.0*KM - CBASE)*smoothstep(0
 // How high the cloud reaches at a place (pw: where the map is read). This project's own map carries heights measured
 // from the cloud tops' temperature; without it, brighter cloud is taken to be deeper. Either way read no finer than
 // about 40 km: cloud tops roll gently, and anything sharper stands up as creases and cliffs when seen from the side.
+// These heights are measured from the ground up (a top is that much colder than the ground below it), so where cloud is
+// drawn the height of the ground - smoothed over some 150 km: gBase - is added. Without that, cloud over Antarctica's
+// 3 km of ice or over Tibet would lie under the ground.
+float gBase = 0.0;
 float topAt(vec3 pw, float lod, float lat, float deck){
   float l = max(lod, 2.0);
-  if (uTops > 0.5) return max(textureLod(tLive, uvOf(pw), l).g*CTOP, 0.5*KM);
-  return topOfC(cfrac(pw, l + 0.6, lat), deck);
+  float h = uTops > 0.5 ? max(textureLod(tLive, uvOf(pw), l).g*CTOP, 0.5*KM) : topOfC(cfrac(pw, l + 0.6, lat), deck);
+  return min(h + gBase, 0.985*CTOP);
 }
 // Returns cloud OPTICAL THICKNESS tau.
 // Base: a real global cloud field: this hour's map when there is one, else the NASA Blue Marble cloud layer (not
@@ -287,7 +291,7 @@ float cloudsW(vec3 p, vec3 pw, float oct){
   if (sOct > 0.0){
     // ---- which family: from how high the top is and how much cloud there is
     // (without measured heights only the brightest cloud is taken for deep; the rest, like most cloud, for low)
-    float hk = uTops > 0.5 ? topAt(pw, lod, lat, 0.0)/KM : 2.0 + 9.0*smoothstep(0.72, 0.9, c)*(1.0 - 0.85*lowDeck(p));
+    float hk = uTops > 0.5 ? (topAt(pw, lod, lat, 0.0) - gBase)/KM : 2.0 + 9.0*smoothstep(0.72, 0.9, c)*(1.0 - 0.85*lowDeck(p));
     float high = smoothstep(5.0, 8.5, hk);
     // (thin cloud is at the edge of what the map can detect: it flickers from one 10 km spot to the next and drops
     // to nothing in places. A veil drawn straight from that shows the map's squares and hard-edged holes, so cirrus
@@ -296,7 +300,11 @@ float cloudsW(vec3 p, vec3 pw, float oct){
     float wCi = high*(1.0 - smoothstep(0.22, 0.55, cT));                          // thin and high: cirrus
     if (max(c, cT) > 0.004){
       float flatv = (1.0 - smoothstep(2.0, 3.5, hk))*smoothstep(0.86, 0.97, c);     // low and full: stratus, fog
-      float wBr = (1.0 - smoothstep(2.5, 6.0, hk))*(1.0 - flatv)*(1.0 - wCi);       // low and not full: broken into clumps
+      // (Heaped cloud needs a surface that warms the air above it. Over the polar ice and the seas round it low cloud
+    // lies in thin even sheets; there is no measurement of its texture there either - beyond 72 degrees the cloud
+    // comes from the weather model.)
+    float polar = smoothstep(62.0, 72.0, abs(lat));
+    float wBr = (1.0 - smoothstep(2.5, 6.0, hk))*(1.0 - flatv)*(1.0 - wCi)*(1.0 - polar);   // low and not full: broken into clumps
       float wSo = max(1.0 - wCi - wBr, 0.0);                                        // the rest: a continuous sheet
       float deepv = high*smoothstep(0.45, 0.8, c);                                  // thick and high: storm and front tops
       vec3 q0 = pw*650.0;
@@ -566,6 +574,11 @@ void main(){
   vec2 uvB = vec2(fract(uv.x + 0.5) - 0.5, uv.y);
   vec2 dx = dFdx(uv), dy = dFdy(uv), dxB = dFdx(uvB), dyB = dFdy(uvB);
   if (abs(dxB.x) + abs(dyB.x) < abs(dx.x) + abs(dy.x)) { dx.x = dxB.x; dy.x = dyB.x; }
+  // At a pole every longitude meets inside a few pixels, so there the change in longitude from one pixel to the next
+  // says nothing about how much ground a pixel covers - taken at its word, those pixels would show the average colour
+  // of the whole Earth (a dark blue dot on the ice). No pixel covers more than its own footprint.
+  float gmax = 3.0*fp/(PI*max(dot(n, -rd), 0.05));
+  dx = clamp(dx, -gmax, gmax); dy = clamp(dy, -gmax, gmax);
   vec3 Lg = vec3(0.0); float Lw = 0.0;                        // ground: light toward the eye; what a white surface would send
   if (cov > 0.0){                                             // (rays that miss the globe skip all of this)
   float water = textureGrad(tWater, uv, dx, dy).r;
@@ -661,6 +674,7 @@ void main(){
     if (t1 > t0){
       vec3 nref = normalize(ro + rd*mix(t0, t1, 0.6)); float latR = degrees(asin(clamp(nref.y, -1., 1.)));
       vec3 W = cwarp(nref, latR) - nref;                       // one shift for the whole ray (it varies slowly)
+      gBase = max(textureLod(tTopo, uvOf(nref), log2(max(uTexR*0.025, 1.0))).r*HS, 0.0);   // the ground below, likewise
       float deck = abs(abs(latR) - 22.0) < 18.0 ? lowDeck(nref) : 0.0;
       float mvC = hit ? clamp(dot(n, -rd), 0.0, 1.0) : 0.0;
       bool deep = CTOP*sqrt(1.0 - mvC*mvC) > 0.6*t0*uPix;       // march in earnest only where height shifts things by a pixel
@@ -1191,6 +1205,11 @@ function loadTex(unit, url, uname, gray, maxW){
       }
       if (gray) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, src);
       else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE, src);
+      if (uname === 'tDay'){                                // the picture's last row, at the South Pole, is dark: repeat the row above it
+        const row = document.createElement('canvas'); row.width = src.width; row.height = 1;
+        row.getContext('2d').drawImage(src, 0, src.height - 2, src.width, 1, 0, 0, src.width, 1);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, src.height - 1, gl.RGB, gl.UNSIGNED_BYTE, row);
+      }
       if (uname === 'tTopo'){ gl.useProgram(P); gl.uniform1f(U.uTexR, src.width/(2*Math.PI)); }
       if (uname === 'tCloud' || uname === 'tWater') keepSmall(uname, img);
       if (uname === 'tCloud' || uname === 'tWater' || uname === 'tTopo') rawImgs[uname] = img;

@@ -52,6 +52,8 @@ Limits:
   - in between (middle cloud): a continuous, gently uneven sheet.
 
   Which family is where is measured. The single clumps and streaks are not the real ones, and cirrus streaks always run roughly east-west.
+- Poleward of about 70° low cloud is drawn as a thin even sheet, not as clumps: heaped cloud needs a surface that warms the air, and there is no measurement of its texture there (the cloud comes from the weather model).
+- Cloud heights are measured from the ground up, so the app adds the height of the ground below (smoothed over about 150 km). Cloud over Antarctica's ice or over Tibet sits above the surface, not inside it.
 - Only one layer is known at each spot. Thin high cloud above low cloud is filed at a height between the two.
 - Without this project's map (the stand-in picture or the stored map) there are no measured heights: only the brightest cloud is drawn as deep, the rest as low, and there is no cirrus.
 - Seen from the side, cloud is a lit, lumpy sheet at the right height, not a true volume: towers do not stand up as separate shapes.
