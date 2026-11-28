@@ -17,7 +17,9 @@ How cloud is read:
   * At night, from the infrared pictures: how much colder a place is than the warmest it has been at this hour over
     the last week, turned into brightness with the relation measured on the daylit side of the same picture. Low cloud,
     which is as warm as the ground and so invisible that way, is taken from the model there.
-  * How high the tops are comes from how much colder they are than the ground (6.5 K for every kilometre).
+  * How high the tops are comes from how much colder they are than the ground (6.5 K for every kilometre). Thin
+    cloud lets the ground shine through and reads too warm; in daylight its dimness says how thin it is, and the
+    ground's share of the reading is taken out.
   * The value written is the one the app's shader expects: 0 = clear, else 255*(0.06 + 0.94*c), where c is the cloud
     amount whose brightness the shader draws as c^1.15 * mix(0.5, 0.9, smoothstep(0.2, 0.85, c)).
 
@@ -327,9 +329,24 @@ def convert(t, lat, lon, lw, vis, sw, lw_clear, vis_clear_rho, water, red, model
     R = Rv*wv + Rn*(1.0 - wv)
     # ---- how high the tops are: air cools about 6.5 K with every kilometre, so a top that much colder than the ground
     # stands that much higher (a count is half a kelvin down from 333 K; clear air reads about 3 K below the ground).
-    # Thin high cloud lets the warm ground shine through and reads too low; cloud no colder than the ground is low cloud.
+    # Cloud no colder than the ground is low cloud.
     ground = model['ts'] if model is not None and 'ts' in model else (333.0 - 0.5*clear) + 3.0
-    top = np.where(lw > 0, np.clip((ground - (333.0 - 0.5*lw))/6.5, 1.0, TOP_KM), 2.0).astype(np.float32)
+    seen = 333.0 - 0.5*lw
+    # Thin cloud lets the warm ground shine through, so it reads warmer - lower - than it is: cirrus at 11 km can read
+    # like cloud at 2 km. In daylight the visible picture says how thin the cloud is (dim = thin), and so how much of
+    # the infrared reading is the cloud's own (eps: 1 for cloud nothing shines through; infrared is absorbed about half
+    # as strongly as visible light is scattered). The ground's share is taken out, in radiance at 11 micrometres, and
+    # what is left is the cloud's own temperature. Only the cooling that counted as cloud above is used, so clear sky
+    # and broken low cloud stay low. At night there is no visible picture, and thin high cloud still reads too low.
+    if has_vis:
+        Rc = np.clip(Rv, 0.0, 0.93)
+        eps = 1.0 - np.exp(-0.5*Rc/(0.075*(1.0 - Rc))/np.maximum(muv, 0.3))
+        eps = 1.0 - wv*(1.0 - np.clip(eps, 0.15, 1.0))
+        planck = lambda T: 1.0/(np.exp(1308.0/T) - 1.0)
+        own = (planck(seen) - (1.0 - eps)*planck(seen + 0.5*rise))/eps
+        seen = np.where(rise > 0, np.minimum(seen, 1308.0/np.log1p(1.0/np.maximum(own, planck(190.0)))), seen)
+        del Rc, eps, own
+    top = np.where(lw > 0, np.clip((ground - seen)/6.5, 1.0, TOP_KM), 2.0).astype(np.float32)
     # ---- how far to trust it: near the edge of a satellite's view the ground is seen at a grazing angle, then not at all
     trust = ss(0.22, 0.34, muv)*(lw > 0)
     return R.astype(np.float32), trust.astype(np.float32), dict(Rv=Rv, wv=wv, Ri=Ri, low=low, m=m, top=top)
