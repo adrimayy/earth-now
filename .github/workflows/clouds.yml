@@ -3,9 +3,17 @@
 # (the app then falls back to its other cloud sources).
 name: clouds
 on:
+  # NOAA posts each hour's satellite pictures about 35-40 minutes after the hour starts. GitHub starts scheduled jobs
+  # late and skips some (at one start an hour it ran once in thirteen hours), so this asks four times an hour; a start
+  # that finds the latest hour already published stops after a minute without doing anything.
   schedule:
-    - cron: "50 * * * *"   # NOAA posts each hour's satellite pictures about 35-40 minutes after the hour starts
+    - cron: "12,27,42,57 * * * *"
   workflow_dispatch:
+    inputs:
+      only_if_new:
+        description: "Stop early if the latest hour is already published (what the scheduled starts do)"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ['tools/clouds.py', '.github/workflows/clouds.yml']
@@ -26,8 +34,10 @@ jobs:
       - run: pip install numpy scipy pillow netCDF4 pygrib
       # the last published map: reused beyond the satellites' view if the weather model cannot be fetched
       - run: curl -sfL -o previous.jpg "https://raw.githubusercontent.com/${{ github.repository }}/live/clouds.jpg" || true
+      # what is published now, read from the branch itself (the raw file address can answer from a copy minutes old)
+      - run: git fetch -q --depth 1 origin live && git show FETCH_HEAD:clouds.json > live.json || true
       # (the log is published next to the map, so a bad hour can be looked into)
-      - run: mkdir -p site && set -o pipefail && python tools/clouds.py --out site --previous previous.jpg 2>&1 | tee site/log.txt
+      - run: mkdir -p site && set -o pipefail && python tools/clouds.py --out site --previous previous.jpg ${{ (github.event_name == 'schedule' || inputs.only_if_new) && '--unless live.json' || '' }} 2>&1 | tee site/log.txt
       - name: Publish
         run: |
           if [ ! -f site/clouds.jpg ]; then echo "nothing new to publish"; exit 0; fi
